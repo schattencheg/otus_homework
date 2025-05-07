@@ -20,6 +20,7 @@ class DataProvider:
         self.data: Dict[str, pd.DataFrame] = {}
         # Create Data directory if it doesn't exist
         self.dir_data: str = os.path.join('data', resolution.name)
+        #self.data_load()
 
     def data_request(self):
         for ticker in self.tickers:
