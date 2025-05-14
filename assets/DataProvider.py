@@ -3,12 +3,15 @@ import os
 from typing import Dict, List
 import pandas as pd
 import yfinance as yf
-from enums import DataPeriod, DataResolution
+from pathvalidate import sanitize_filepath
+from assets.DataLoader import DataLoaderBase, DataLoaderCCXT
+from assets.enums import DataPeriod, DataResolution
+
 
 class DataProvider:
-    def __init__(self,  tickers: List[str] = ['BTC-USD'], 
+    def __init__(self,  tickers: List[str] = ['BTC/USDT'], 
                         resolution: DataResolution = DataResolution.DAY_01, 
-                        period: DataPeriod = DataPeriod.YEAR_MAX,
+                        period: DataPeriod = DataPeriod.YEAR_01,
                         ts: dt.date = None,
                         te: dt.date = None):
         self.tickers: List[str] = tickers
@@ -18,44 +21,29 @@ class DataProvider:
         self.te: dt.date = te
         #
         self.data: Dict[str, pd.DataFrame] = {}
+        self.data_loader: DataLoaderBase = DataLoaderCCXT(tickers, resolution, period, ts, te)
         # Create Data directory if it doesn't exist
         self.dir_data: str = os.path.join('data', resolution.name)
-        #self.data_load()
-
+    
     def data_request(self):
-        for ticker in self.tickers:
-            df = get_data_by_ticker(ticker)
-            df.columns = [x.lower() for x in df.columns]
-            df.index.name = df.index.name.lower()
-            df.to_csv(os.path.join(self.dir_data, ticker + '.csv'))
-            self.data[ticker] = df
-
-    def data_request_by_ticker(self, ticker: str, ts: dt.date = None, te: dt.date = None) -> pd.DataFrame:
-        if self.ts is None:
-            df = yf.download(ticker, multi_level_index=False, progress=False, 
-                                period=self.period.value, interval=self.resolution.value)
-        else:
-            if te is None:
-                te = dt.datetime.now().date()
-            df = yf.download(ticker, multi_level_index=False, progress=False, 
-                                start=self.ts, end=self.te, interval=self.resolution.value)
-        df.columns = [x.lower() for x in df.columns]
-        df.index.name = df.index.name.lower()
-        return df
-
+        self.data_loader.data_request()
+    
     def data_refresh(self):
+        return
         for ticker in self.tickers:
             ts = self.data[ticker].index[-1]
             self.data_request_by_ticker(ticker, ts)
 
     def data_load(self):
+        return
         for ticker in self.tickers:
-            self.data_load_by_ticker(ticker)
+            self.data[ticker] = self.data_load_by_ticker(ticker)
 
     def data_load_by_ticker(self, ticker):
+        return
         if ticker not in self.tickers:
-            if os.path.exists(os.path.join(self.dir_data, ticker + '.csv')):
-                self.data[ticker] = pd.read_csv(os.path.join(self.dir_data, ticker + '.csv'), index_col=0)
+            if os.path.exists(sanitize_filepath(os.path.join(self.dir_data, ticker + '.csv'))):
+                self.data[ticker] = pd.read_csv(sanitize_filepath(os.path.join(self.dir_data, ticker + '.csv')), index_col=0)
         return self.data[ticker]
 
     def data_save(self):
@@ -65,7 +53,7 @@ class DataProvider:
     def data_save_by_ticker(self, ticker):
         if not os.path.exists(self.dir_data):
             os.makedirs(self.dir_data)
-        self.data[ticker].to_csv(os.path.join(self.dir_data, ticker + '.csv'), index=True)
+        self.data_loader.data[ticker].to_csv(self.sanitize_path(os.path.join(self.dir_data, ticker + '.csv')), index=True)
 
     def data_clear(self):
         for ticker in self.tickers:
@@ -118,6 +106,5 @@ class DataProvider:
             print(f" Удалено {removed_count} аномальных цен {ticker}")
         return df
 
-if __name__ == '__main__':
-    dp = DataProvider()
-    dp.data_request_by_ticker('BTC-USD')
+    def sanitize_path(self, path):
+        return sanitize_filepath(path.replace('/','_'))

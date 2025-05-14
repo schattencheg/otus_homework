@@ -30,5 +30,3 @@ class DataPeriod(Enum):
     YEAR_02 = '2y'
     YEAR_05 = '5y'
     YEAR_10 = '10y'
-    YEAR_YTD = 'ytd'
-    YEAR_MAX = 'max'
