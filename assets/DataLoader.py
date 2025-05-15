@@ -20,7 +20,7 @@ class DataLoaderBase:
     def data_request(self):
         pass
 
-    def data_request_by_ticker(self, ticker: str, ts: dt.date = None, te: dt.date = None) -> pd.DataFrame:
+    def data_request_by_ticker(self, ticker: str, ts: dt.date = None) -> pd.DataFrame:
         pass
 
 
@@ -42,20 +42,6 @@ class DataLoaderCCXT(DataLoaderBase):
                 df.columns = [x.lower() for x in df.columns]
                 df.index.name = df.index.name.lower()
                 self.data[ticker] = df
-
-    def _get_available_symbols(self) -> List[str]:
-        try:
-            markets = self.exchange.load_markets()
-            return list(markets.keys())
-        except Exception as e:
-            print(f"Error loading markets: {str(e)}")
-            return []
-
-    def _validate_tickers(self):
-        invalid_tickers = [ticker for ticker in self.tickers if ticker not in self.available_symbols]
-        if invalid_tickers:
-            print(f"Warning: The following tickers are not available on {self.exchange.name}: {invalid_tickers}")
-            self.tickers = [ticker for ticker in self.tickers if ticker not in invalid_tickers]
 
     def data_request_by_ticker(self, ticker: str, ts: dt.date = None, te: dt.date = None) -> pd.DataFrame:
         if ticker in self.data:
@@ -138,3 +124,18 @@ class DataLoaderCCXT(DataLoaderBase):
         elif self.period == DataPeriod.YEAR_10:
             days = 120 * 4 * 7
         return days
+
+    def _get_available_symbols(self) -> List[str]:
+        try:
+            markets = self.exchange.load_markets()
+            return list(markets.keys())
+        except Exception as e:
+            print(f"Error loading markets: {str(e)}")
+            return []
+
+    def _validate_tickers(self):
+        invalid_tickers = [ticker for ticker in self.tickers if ticker not in self.available_symbols]
+        if invalid_tickers:
+            print(f"Warning: The following tickers are not available on {self.exchange.name}: {invalid_tickers}")
+            self.tickers = [ticker for ticker in self.tickers if ticker not in invalid_tickers]
+

@@ -2,7 +2,6 @@ import datetime as dt
 import os
 from typing import Dict, List
 import pandas as pd
-import yfinance as yf
 from pathvalidate import sanitize_filepath
 from assets.DataLoader import DataLoaderBase, DataLoaderCCXT
 from assets.enums import DataPeriod, DataResolution
@@ -15,6 +14,7 @@ class DataProvider:
                         ts: dt.date = None,
                         te: dt.date = None):
         self.tickers: List[str] = tickers
+        self.tickers_path: Dict[str, str] = {ticker: ticker.replace('/', '_') for ticker in tickers}
         self.resolution: DataResolution = resolution
         self.period: DataPeriod = period
         self.ts: dt.date = ts
@@ -23,28 +23,36 @@ class DataProvider:
         self.data: Dict[str, pd.DataFrame] = {}
         self.data_loader: DataLoaderBase = DataLoaderCCXT(tickers, resolution, period, ts, te)
         # Create Data directory if it doesn't exist
-        self.dir_data: str = os.path.join('data', resolution.name)
+        self.dir_data: str = self.sanitize_path(os.path.join('data', resolution.name))
     
     def data_request(self):
-        self.data_loader.data_request()
+        for ticker in self.tickers:
+            self.data[ticker] = self.data_request_by_ticker(ticker)
+
+    def data_request_by_ticker(self, ticker, ts: dt.date = None):
+        df: pd.DataFrame = None
+        if ticker in self.tickers:
+            if os.path.exists(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv'))):
+                df = self.data_loader.data_request_by_ticker(ticker, ts)
+        return df
     
     def data_refresh(self):
-        return
         for ticker in self.tickers:
             ts = self.data[ticker].index[-1]
             self.data_request_by_ticker(ticker, ts)
 
     def data_load(self):
-        return
         for ticker in self.tickers:
             self.data[ticker] = self.data_load_by_ticker(ticker)
 
     def data_load_by_ticker(self, ticker):
-        return
-        if ticker not in self.tickers:
-            if os.path.exists(sanitize_filepath(os.path.join(self.dir_data, ticker + '.csv'))):
-                self.data[ticker] = pd.read_csv(sanitize_filepath(os.path.join(self.dir_data, ticker + '.csv')), index_col=0)
-        return self.data[ticker]
+        df: pd.DataFrame = None
+        if ticker in self.tickers:
+            if os.path.exists(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv'))):
+                df = pd.read_csv(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv')), index_col=0)
+                # Convert index to datetime
+                df.index = pd.to_datetime(df.index)
+        return df
 
     def data_save(self):
         for ticker in self.tickers:
@@ -53,7 +61,7 @@ class DataProvider:
     def data_save_by_ticker(self, ticker):
         if not os.path.exists(self.dir_data):
             os.makedirs(self.dir_data)
-        self.data_loader.data[ticker].to_csv(self.sanitize_path(os.path.join(self.dir_data, ticker + '.csv')), index=True)
+        self.data[ticker].to_csv(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv')), index=True)
 
     def data_clear(self):
         for ticker in self.tickers:
@@ -107,4 +115,4 @@ class DataProvider:
         return df
 
     def sanitize_path(self, path):
-        return sanitize_filepath(path.replace('/','_'))
+        return sanitize_filepath(path).lower()

@@ -1,0 +1,9 @@
+pandas
+ccxt
+pathvalidate
+numpy
+tqdm
+backtesting
+pandas_ta
+scikit-learn
+plotly
