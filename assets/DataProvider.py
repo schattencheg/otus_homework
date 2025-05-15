@@ -32,8 +32,10 @@ class DataProvider:
     def data_request_by_ticker(self, ticker, ts: dt.date = None):
         df: pd.DataFrame = None
         if ticker in self.tickers:
+            df = self.data_loader.data_request_by_ticker(ticker, ts)
             if os.path.exists(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv'))):
-                df = self.data_loader.data_request_by_ticker(ticker, ts)
+                if ticker in self.data and self.data[ticker] is not None:
+                    df = pd.concat([df, self.data[ticker]]).drop_duplicates().sort_index()
         return df
     
     def data_refresh(self):
@@ -43,7 +45,10 @@ class DataProvider:
 
     def data_load(self):
         for ticker in self.tickers:
-            self.data[ticker] = self.data_load_by_ticker(ticker)
+            df = self.data_load_by_ticker(ticker)
+            if df is not None:
+                self.data[ticker] = df
+        return bool(self.data)
 
     def data_load_by_ticker(self, ticker):
         df: pd.DataFrame = None
@@ -62,6 +67,11 @@ class DataProvider:
         if not os.path.exists(self.dir_data):
             os.makedirs(self.dir_data)
         self.data[ticker].to_csv(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv')), index=True)
+
+    def data_save_by_ticker_and_df(self, ticker, df: pd.DataFrame):
+        if not os.path.exists(self.dir_data):
+            os.makedirs(self.dir_data)
+        df.to_csv(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv')), index=True)
 
     def data_clear(self):
         for ticker in self.tickers:

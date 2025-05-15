@@ -30,7 +30,7 @@ class DataLoaderCCXT(DataLoaderBase):
                         time_start: dt.date = None, time_end: dt.date = None,
                         exchange: str = 'binance'):
         super().__init__(tickers, resolution, period, time_start, time_end)
-        self.exchange = getattr(ccxt, exchange)()
+        self.exchange: ccxt.Exchange = getattr(ccxt, exchange)()
         self.timeframe = self._get_timeframe()
         #self.available_symbols = self._get_available_symbols()
         #self._validate_tickers()
@@ -64,7 +64,7 @@ class DataLoaderCCXT(DataLoaderBase):
                 symbol=ticker,
                 timeframe=self.timeframe,
                 since=since,
-                limit=1000  # Adjust based on exchange limits
+                params = {'paginate': True}
             )
 
             if not ohlcv:
@@ -73,7 +73,7 @@ class DataLoaderCCXT(DataLoaderBase):
             # Convert to DataFrame
             df = pd.DataFrame(
                 ohlcv,
-                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
             )
 
             # Convert timestamp to datetime

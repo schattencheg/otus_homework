@@ -1,10 +1,10 @@
 from backtesting import Strategy
 import pandas as pd
 import numpy as np
-from .DataProvider import DataProvider
-from .StrategyHW2 import StrategyHW2
+from assets.DataProvider import DataProvider
 
-class HW2Strategy(Strategy):
+
+class HW2Strategy_SMA_RSI(Strategy):
     # Define parameters
     sma_short = 10
     sma_long = 20
@@ -13,43 +13,101 @@ class HW2Strategy(Strategy):
     rsi_lower = 30
     
     def init(self):
-        # Create a DataProvider with our data
-        df = pd.DataFrame({
-            'Open': self.data.Open,
-            'High': self.data.High,
-            'Low': self.data.Low,
-            'Close': self.data.Close,
-            'Volume': self.data.Volume
-        }, index=self.data.index)
-        
-        data_provider = DataProvider()
-        data_provider.data = {'BTC/USDT': df}
-        
-        # Create StrategyHW2 instance
-        self.strategy = StrategyHW2(data_provider)
-        
         # Calculate indicators for visualization
         close_series = pd.Series(self.data.Close)
         self.sma_short_line = self.I(lambda x: x.rolling(window=self.sma_short).mean(), close_series)
         self.sma_long_line = self.I(lambda x: x.rolling(window=self.sma_long).mean(), close_series)
         
-        # Get signals from StrategyHW2
-        signals_df = self.strategy.run()
-        
-        # Store signals for use in next()
-        self.signals = signals_df.set_index('timestamp')
-        print(f"Loaded {len(self.signals)} signals from StrategyHW2")
+        # Calculate RSI
+        delta = close_series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=self.rsi_period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_period).mean()
+        rs = gain / loss
+        self.rsi = self.I(lambda x: 100 - (100 / (1 + rs)), close_series)
 
     def next(self):
-        # Get current date
-        current_date = self.data.index[-1]
-        
-        # Check if we have a signal for this date
-        if current_date in self.signals.index:
-            signal = self.signals.loc[current_date]
+        # Check if we have enough data
+        if pd.isna(self.sma_long_line[-1]) or pd.isna(self.rsi[-1]):
+            return
             
-            # Execute the signal with size 1.0 (use all available cash)
-            if signal['action'] == 'BUY' and not self.position:
+        # Calculate trend strength
+        trend_strength = (self.sma_short_line[-1] - self.sma_long_line[-1]) / self.sma_long_line[-1]
+        
+        # Buy signal conditions
+        sma_cross_up = (self.sma_short_line[-1] > self.sma_long_line[-1] and
+                       self.sma_short_line[-2] <= self.sma_long_line[-2])
+        rsi_oversold = self.rsi[-1] < self.rsi_lower
+        strong_uptrend = trend_strength > 0.015  # 1.5% minimum trend strength
+        
+        # Sell signal conditions
+        sma_cross_down = (self.sma_short_line[-1] < self.sma_long_line[-1] and
+                         self.sma_short_line[-2] >= self.sma_long_line[-2])
+        rsi_overbought = self.rsi[-1] > self.rsi_upper
+        strong_downtrend = trend_strength < -0.015  # -1.5% minimum trend strength
+        
+        # Execute signals
+        if not self.position:
+            # Buy when price is rising and trend is strong
+            if (sma_cross_up and strong_uptrend) or (rsi_oversold and not strong_downtrend):
                 self.buy(size=1.0)
-            elif signal['action'] == 'SELL' and self.position:
-                self.sell(size=1.0)
+            #elif (sma_cross_down and strong_downtrend) or (rsi_overbought and not strong_uptrend):
+            #    self.sell(size=1.0)
+        else:
+            if self.position.is_long:
+                # Sell when price is falling or trend is weak
+                if sma_cross_down or rsi_overbought or strong_downtrend:
+                    self.sell(size=1.0)
+            else:
+                # Buy when price is falling or trend is weak
+                if sma_cross_up or rsi_oversold or strong_uptrend:
+                    self.buy(size=1.0)
+
+
+class HW2Strategy_SMA(Strategy):
+    # Define parameters
+    sma_short = 10
+    sma_long = 20
+    rsi_period = 14
+    rsi_upper = 70
+    rsi_lower = 30
+    
+    def init(self):
+        # Calculate indicators for visualization
+        close_series = pd.Series(self.data.Close)
+        self.sma_short_line = self.I(lambda x: x.rolling(window=self.sma_short).mean(), close_series)
+        self.sma_long_line = self.I(lambda x: x.rolling(window=self.sma_long).mean(), close_series)
+        
+    def next(self):
+        # Check if we have enough data
+        if pd.isna(self.sma_long_line[-1]):
+            return
+            
+        # Calculate trend strength
+        trend_strength = (self.sma_short_line[-1] - self.sma_long_line[-1]) / self.sma_long_line[-1]
+        
+        # Buy signal conditions
+        sma_cross_up = (self.sma_short_line[-1] > self.sma_long_line[-1] and
+                       self.sma_short_line[-2] <= self.sma_long_line[-2])
+        strong_uptrend = trend_strength > 0.015  # 1.5% minimum trend strength
+        
+        # Sell signal conditions
+        sma_cross_down = (self.sma_short_line[-1] < self.sma_long_line[-1] and
+                         self.sma_short_line[-2] >= self.sma_long_line[-2])
+        strong_downtrend = trend_strength < -0.015  # -1.5% minimum trend strength
+        
+        # Execute signals
+        if not self.position:
+            # Buy when price is rising and trend is strong
+            if (sma_cross_up and strong_uptrend) or (not strong_downtrend):
+                self.buy(size=1.0)
+            #elif (sma_cross_down and strong_downtrend) or (not strong_uptrend):
+            #    self.sell(size=1.0)
+        else:
+            if self.position.is_long:
+                # Sell when price is falling or trend is weak
+                if sma_cross_down or strong_downtrend:
+                    self.sell(size=1.0)
+            else:
+                # Buy when price is falling or trend is weak
+                if sma_cross_up or strong_uptrend:
+                    self.buy(size=1.0)
