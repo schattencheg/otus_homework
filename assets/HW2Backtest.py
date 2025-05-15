@@ -9,6 +9,7 @@ from plotly.subplots import make_subplots
 from tqdm import tqdm
 from heapq import nlargest
 
+
 class HW2Backtest:
     def __init__(self, data: pd.DataFrame):
         if data is None or data.empty:
@@ -46,9 +47,10 @@ class HW2Backtest:
             if params['sma_short'] >= params['sma_long']:
                 continue
                 
-            # Ensure rsi_lower is less than rsi_upper
-            if params['rsi_lower'] >= params['rsi_upper']:
-                continue
+            # Ensure rsi_lower is less than rsi_upper if RSI parameters are present
+            if 'rsi_lower' in params and 'rsi_upper' in params:
+                if params['rsi_lower'] >= params['rsi_upper']:
+                    continue
             
             try:
                 # Run backtest with current parameters
@@ -75,28 +77,29 @@ class HW2Backtest:
                 print(f"Error testing parameters {params}: {str(e)}")
                 continue
         
+        if not overall_score:
+            print("\nNo valid parameter combinations found. All combinations resulted in errors.")
+            return None
+            
         idxs = [x[0] for x in nlargest(count, overall_score.items(), key=lambda i: i[1])]
         best_params = [overall_params[i] for i in idxs]
         best_scores = [overall_score[i] for i in idxs]
         best_results = [overall_results[i] for i in idxs]
+        print("\nBest parameters found:")
+        for params, score in zip(best_params, best_scores):
+            print(f"{score:.2f}: {params}")
+        best_score = best_scores[0]
+        best_result = best_results[0]
 
-        if best_params:
-            print("\nBest parameters found:")
-            for params, score in zip(best_params, best_scores):
-                print(f"{score:.2f}: {params}")
-            best_score = best_scores[0]
-            best_result = best_results[0]
-
-            print(f"\nBest score: {best_score:.2f}")
-            print("\nBest strategy performance:")
-            print(f"Return: {best_result['Return [%]']:.2f}%")
-            print(f"Trades count: {best_result['Trades']}")
-            print(f"Sharpe Ratio: {best_result['Sharpe Ratio']:.2f}")
-            print(f"Max Drawdown: {best_result['Max. Drawdown [%]']:.2f}%")
-            print(f"Win Rate: {best_result['Win Rate [%]']:.2f}%")
+        print(f"\nBest score: {best_score:.2f}")
+        print("\nBest strategy performance:")
+        print(f"Return: {best_result['Return [%]']:.2f}%")
+        print(f"Trades count: {best_result['Trades']}")
+        print(f"Sharpe Ratio: {best_result['Sharpe Ratio']:.2f}")
+        print(f"Max Drawdown: {best_result['Max. Drawdown [%]']:.2f}%")
+        print(f"Win Rate: {best_result['Win Rate [%]']:.2f}%")
             
         return best_params
-
 
     def create_performance_dashboard(self, strategies_results: Dict[str, Dict[str, float]]) -> None:
         """Create a dashboard comparing different strategies performance"""
@@ -125,6 +128,7 @@ class HW2Backtest:
 
         fig.update_layout(height=800, width=1200, title_text='Strategy Performance Comparison')
         fig.show()
+
 
 if __name__ == "__main__":
     pass

@@ -7,3 +7,4 @@ backtesting
 pandas_ta
 scikit-learn
 plotly
+finplot

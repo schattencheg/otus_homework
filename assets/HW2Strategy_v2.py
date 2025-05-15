@@ -87,7 +87,8 @@ class HW2Strategy_SMA_RSI(Strategy):
                 # Calculate position size based on volatility
                 stop_distance = self.initial_stop_atr * self.atr[-1]
                 risk_amount = self.equity * self.risk_per_trade
-                position_size = risk_amount / stop_distance
+                # Calculate size in units, rounded to nearest whole number
+                position_size = max(1, int(risk_amount / (stop_distance * current_price)))
                 
                 # Set initial stop loss
                 self.trailing_stop = current_price - stop_distance
@@ -107,9 +108,6 @@ class HW2Strategy_SMA(Strategy):
     # Define parameters
     sma_short = 10
     sma_long = 20
-    rsi_period = 14
-    rsi_upper = 70
-    rsi_lower = 30
     
     # Risk management parameters
     atr_period = 14  # ATR period for volatility calculation
@@ -123,6 +121,21 @@ class HW2Strategy_SMA(Strategy):
         self.sma_short_line = self.I(lambda x: x.rolling(window=self.sma_short).mean(), close_series)
         self.sma_long_line = self.I(lambda x: x.rolling(window=self.sma_long).mean(), close_series)
         
+        # Calculate ATR for position sizing and stops
+        high = pd.Series(self.data.High)
+        low = pd.Series(self.data.Low)
+        close = pd.Series(self.data.Close)
+        
+        tr1 = high - low  # Current high - current low
+        tr2 = abs(high - close.shift())  # Current high - previous close
+        tr3 = abs(low - close.shift())  # Current low - previous close
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        self.atr = self.I(lambda x: x.rolling(window=self.atr_period).mean(), tr)
+        
+        # Initialize stop loss tracking
+        self.trailing_stop = None
+        self.initial_stop = None
+    
     def next(self):
         # Check if we have enough data
         if pd.isna(self.sma_long_line[-1]) or pd.isna(self.atr[-1]):
@@ -162,7 +175,8 @@ class HW2Strategy_SMA(Strategy):
                 # Calculate position size based on volatility
                 stop_distance = self.initial_stop_atr * self.atr[-1]
                 risk_amount = self.equity * self.risk_per_trade
-                position_size = risk_amount / stop_distance
+                # Calculate size in units, rounded to nearest whole number
+                position_size = max(1, int(risk_amount / (stop_distance * current_price)))
                 
                 # Set initial stop loss
                 self.trailing_stop = current_price - stop_distance
@@ -176,25 +190,3 @@ class HW2Strategy_SMA(Strategy):
                 if sma_cross_down or strong_downtrend:
                     self.position.close()
                     self.trailing_stop = None
-
-
-''' 
-Risk management
-1. Position Sizing (Risk Management):
-Risk per trade: 2% of equity
-Position size calculated using ATR (Average True Range)
-Formula: position_size = (equity * risk_per_trade) / stop_distance
-This ensures consistent risk across trades regardless of volatility
-2. Stop Loss System:
-Initial stop: 3 ATR units below entry price
-Trailing stop: 2 ATR units below price
-Trailing stop only moves up, never down
-Position automatically closes if price hits stop loss
-3. ATR Calculation:
-Period: 14 days
-Uses True Range: max(high-low, |high-prev_close|, |low-prev_close|)
-Helps measure volatility for both position sizing and stops
-
-
-
-'''
