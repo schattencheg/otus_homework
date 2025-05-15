@@ -2,6 +2,7 @@ import datetime as dt
 import os
 from typing import Dict, List
 import pandas as pd
+import numpy as np
 from pathvalidate import sanitize_filepath
 from assets.DataLoader import DataLoaderBase, DataLoaderCCXT
 from assets.enums import DataPeriod, DataResolution
@@ -73,15 +74,6 @@ class DataProvider:
             os.makedirs(self.dir_data)
         df.to_csv(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv')), index=True)
 
-    def data_clear(self):
-        for ticker in self.tickers:
-            if ticker in self.data:
-                df = self.data[ticker]
-                df = drop_nones(ticker, df)
-                df = drop_high_dispersion(ticker, df)
-                df = drop_price_anomalies(ticker, df)
-                return df
-
     def drop_nones(self, ticker: str, df:  pd.DataFrame):
         # Удаляем пропуски (None)
         initial_length = len(df)
@@ -92,7 +84,7 @@ class DataProvider:
 
     def drop_high_dispersion(self, ticker: str, df: pd.DataFrame, threshold: float = 0.1) -> None:
         # Удаляем данные с высокой дисперсией данных, (High - Low) / ((High + Low) / 2) > threshold
-        dispersion = (df['high'] - df['low']) / ((df['high'] + df['low']) / 2)
+        dispersion = (df['High'] - df['Low']) / ((df['High'] + df['Low']) / 2)
         # Создаём фильтр
         valid_mask = dispersion <= threshold
         # Применяем фильтр
@@ -106,7 +98,7 @@ class DataProvider:
                                 z_threshold: float = 3.0, 
                                 window: int = 20) -> None:
         # Удаляем данные, применяя z-score для МА(window) (если данные более чем на 3 стандартных отклонения - в мусор)
-        price_columns = ['open', 'high', 'low', 'close']
+        price_columns = ['Open', 'High', 'Low', 'Close']
         # Создаём фильтр
         valid_mask = pd.Series(True, index=df.index)
         for col in price_columns:
@@ -123,6 +115,15 @@ class DataProvider:
         if removed_count > 0:
             print(f" Удалено {removed_count} аномальных цен {ticker}")
         return df
+        
+    def data_clear(self):
+        for ticker in self.tickers:
+            if ticker in self.data:
+                df = self.data[ticker]
+                df = self.drop_nones(ticker, df)
+                df = self.drop_high_dispersion(ticker, df)
+                df = self.drop_price_anomalies(ticker, df)
+                return df
 
     def sanitize_path(self, path):
         return sanitize_filepath(path).lower()
