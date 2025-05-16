@@ -20,8 +20,8 @@ class DataProvider:
                         period: DataPeriod = DataPeriod.YEAR_01,
                         ts: dt.date = None,
                         te: dt.date = None,
-                        outlier_std_threshold: float = 3.0,
-                        gap_fill_limit: int = 5):
+                        outlier_std_threshold: float = 5.0,
+                        gap_fill_limit: int = 20):
         self.tickers: List[str] = tickers
         self.tickers_path: Dict[str, str] = {ticker: ticker.replace('/', '_') for ticker in tickers}
         self.resolution: DataResolution = resolution
@@ -452,7 +452,7 @@ class DataProvider:
                 print(f' Удалено {initial_length - len(df)} пустых значений для {ticker}')
             return df
 
-        def drop_high_dispersion(ticker: str, df: pd.DataFrame, threshold: float = 0.1) -> None:
+        def drop_high_dispersion(ticker: str, df: pd.DataFrame, threshold: float = 0.5) -> None:
             # Удаляем данные с высокой дисперсией данных, (High - Low) / ((High + Low) / 2) > threshold
             dispersion = (df['High'] - df['Low']) / ((df['High'] + df['Low']) / 2)
             # Создаём фильтр
@@ -465,7 +465,7 @@ class DataProvider:
             return df
 
         def drop_price_anomalies(ticker: str, df: pd.DataFrame, 
-                                    z_threshold: float = 3.0, 
+                                    z_threshold: float = 5.0, 
                                     window: int = 20) -> None:
             # Удаляем данные, применяя z-score для МА(window) (если данные более чем на 3 стандартных отклонения - в мусор)
             price_columns = ['Open', 'High', 'Low', 'Close']
@@ -517,7 +517,7 @@ class DataProvider:
         df = fill_gaps(df)
         return df
 
-    def data_request(self):
+    def data_request(self, ts: dt.date = None):
         for ticker in self.tickers:
             new_data = self.data_request_by_ticker(ticker, ts)
             self.data[ticker] = new_data
@@ -530,6 +530,10 @@ class DataProvider:
         """Request new data for a ticker and process it through the pipeline"""
         if ticker not in self.tickers:
             return None
+
+        if ticker in self.data:
+            return self.data[ticker]
+
         # Get new data
         new_data = self.data_loader.data_request_by_ticker(ticker, ts)
         if new_data is None or new_data.empty:
@@ -566,4 +570,25 @@ class DataProvider:
             new_data = new_data.sort_index()
         return new_data
 
+    def _get_date_range(self) -> str:
+        days=0
+        if self.period == DataPeriod.DAY_01:
+            days = 1
+        elif self.period == DataPeriod.DAY_05:
+            days = 5
+        elif self.period == DataPeriod.MONTH_01:
+            days = 4 * 7
+        elif self.period == DataPeriod.MONTH_03:
+            days = 3 * 4 * 7
+        elif self.period == DataPeriod.MONTH_06:
+            days = 6 * 4 * 7
+        elif self.period == DataPeriod.YEAR_01:
+            days = 12 * 4 * 7
+        elif self.period == DataPeriod.YEAR_02:
+            days = 24 * 4 * 7
+        elif self.period == DataPeriod.YEAR_05:
+            days = 60 * 4 * 7
+        elif self.period == DataPeriod.YEAR_10:
+            days = 120 * 4 * 7
+        return days
 #endregion

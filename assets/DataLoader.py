@@ -43,7 +43,7 @@ class DataLoaderCCXT(DataLoaderBase):
                 df.index.name = df.index.name.lower()
                 self.data[ticker] = df
 
-    def data_request_by_ticker(self, ticker: str, ts: dt.date = None, te: dt.date = None) -> pd.DataFrame:
+    def data_request_by_ticker(self, ticker: str, ts: dt.date = None) -> pd.DataFrame:
         if ticker in self.data:
             return self.data[ticker]
 
@@ -53,11 +53,6 @@ class DataLoaderCCXT(DataLoaderBase):
             if since is None:
                 since = dt.datetime.now() - dt.timedelta(days=self._get_date_range())
                 since = int((dt.datetime.now() - dt.timedelta(days=self._get_date_range())).timestamp())
-
-            until = int(te.timestamp() * 1000) if te else None
-            if until is None:
-                until = dt.datetime.now()
-                until = int(dt.datetime.now().timestamp())
 
             # Fetch OHLCV data
             ohlcv = self.exchange.fetch_ohlcv(
