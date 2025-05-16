@@ -436,14 +436,20 @@ class DataProvider:
         initial_rows = len(df)
         initial_missing = df.isnull().sum().sum()
         # 1. Clean data
-        df = self.clean_data(ticker, df)
+        df = self.clean_data_for_ticker(ticker, df)
         # 2. Add features
         df = self.add_features(df)
         # Record metrics
         self.record_metrics(ticker, df, initial_rows, initial_missing)
         return df
         
-    def clean_data(self, ticker: str, df: pd.DataFrame) -> pd.DataFrame:
+    def clean_data(self):
+        for ticker in self.tickers:
+            df = self.data[ticker]
+            df = self.clean_data_for_ticker(ticker, df)
+            self.data[ticker] = df
+
+    def clean_data_for_ticker(self, ticker: str = None, df: pd.DataFrame = None) -> pd.DataFrame:
         def drop_nones(ticker: str, df:  pd.DataFrame):
             # Удаляем пропуски (None)
             initial_length = len(df)
