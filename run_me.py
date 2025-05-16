@@ -1,5 +1,5 @@
 from assets.DataProvider import DataProvider
-from assets.HW2Strategy_v2 import HW2Strategy_SMA_RSI, HW2Strategy_SMA
+from assets.HW2Strategy import HW2Strategy_SMA_RSI, HW2Strategy_SMA
 from assets.HW2Backtest import HW2Backtest
 from assets.enums import DataResolution, DataPeriod
 from backtesting import Strategy
@@ -7,8 +7,9 @@ import datetime as dt
 
 def main():
     # Initialize data provider with BTC/USDT data
+    tickers = ['BTC/USDT']
     data_provider = DataProvider(
-        tickers=['BTC/USDT'],
+        tickers=tickers,
         resolution=DataResolution.DAY_01,
         period=DataPeriod.YEAR_05
     )
@@ -17,11 +18,14 @@ def main():
     if not data_provider.data_load():
         data_provider.data_request()
         data_provider.data_save()
-    
+    for ticker in tickers:
+        data_provider.data[ticker] = data_provider.data[ticker].iloc[:-100]
+    data_provider.data_refresh()
+
     # Test both strategies
     
     # 1. Original backtesting strategy
-    btc_data = data_provider.data['BTC/USDT']
+    btc_data = data_provider.data_processed['BTC/USDT']
     backtester: HW2Backtest = HW2Backtest(btc_data)
 
     # Define parameter grids for each strategy

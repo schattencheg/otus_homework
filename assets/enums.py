@@ -12,10 +12,10 @@ class DataResolution(Enum):
     MINUTE_30 = '30m'
     MINUTE_60 = '60m'
     MINUTE_90 = '90m'
-    HOUR = '1h'
+    HOUR_01 = '1h'
     DAY_01 = '1d'
     DAY_05 = '5d'
-    WEEK = '1wk'
+    WEEK_01 = '1wk'
     MONTH_01 = '1mo'
     MONTH_03 = '3mo'
 
