@@ -27,7 +27,7 @@ def main():
     # 1. Original backtesting strategy
     btc_data = data_provider.data_processed['BTC/USDT']
     backtester: HW2Backtest = HW2Backtest(btc_data)
-
+    data_provider.dashboard_features_draw()
     # Define parameter grids for each strategy
     param_grid_sma = {
         'sma_short': [5, 8, 10, 12, 15],

@@ -34,7 +34,8 @@ class DataProvider:
         self.data_loader: DataLoaderBase = DataLoaderCCXT(tickers, resolution, period, ts, te)
         self.outlier_std_threshold = outlier_std_threshold
         self.gap_fill_limit = gap_fill_limit
-        self.fig: go.Figure = None
+        self.dashboard_data: go.Figure = None
+        self.dashboard_features: go.Figure = None
         # Create necessary directories
         self.dir_data: str = self.sanitize_path(os.path.join('data', resolution.name))
         self.dir_metrics: str = self.sanitize_path(os.path.join('data', 'metrics'))
@@ -131,7 +132,7 @@ class DataProvider:
         if df is None or df.empty:
             return
         # Create subplots
-        self.fig = make_subplots(
+        self.dashboard_data = make_subplots(
             rows=3, cols=2,
             subplot_titles=(
                 'Price and Volume',
@@ -143,7 +144,7 @@ class DataProvider:
             ),
             vertical_spacing=0.12)
         # 1. Price and Volume
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Candlestick(
                 x=df.index,
                 open=df['Open'],
@@ -153,43 +154,43 @@ class DataProvider:
                 name='OHLC'),
             row=1, col=1)
         if 'Volume' in df.columns:
-            self.fig.add_trace(
+            self.dashboard_data.add_trace(
                 go.Bar(x=df.index, y=df['Volume'], name='Volume'),
                 row=2, col=2
             )
         # 2. Technical Indicators
-        self.fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=1, col=2)
-        self.fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD'), row=1, col=2)
+        self.dashboard_data.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=1, col=2)
+        self.dashboard_data.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD'), row=1, col=2)
         # 3. Data Quality Metrics
         metrics = self.metrics_history[self.metrics_history['ticker'] == ticker]
         for col in ['missing_values', 'outliers_removed', 'gaps_filled']:
-            self.fig.add_trace(
+            self.dashboard_data.add_trace(
                 go.Scatter(x=metrics['timestamp'], y=metrics[col], name=col),
                 row=2, col=1)
         # 4. Returns Distribution
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Histogram(x=df['Returns'], name='Returns Distribution', nbinsx=50),
             row=2, col=2)
         # 5. Feature Correlations
         corr = df[['Close', 'Volume', 'RSI', 'MACD', 'Volatility']].corr()
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Heatmap(z=corr.values, x=corr.index, y=corr.columns, name='Correlations'),
             row=3, col=1)
         # 6. Missing Data Points
         missing = df.isnull().sum(axis=1)
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Scatter(x=df.index, y=missing, name='Missing Points'),
             row=3, col=2)
         # Update layout
-        self.fig.update_layout(
+        self.dashboard_data.update_layout(
             height=1200,
             width=1600,
             title_text=f'Data Analysis Dashboard - {ticker}',
             showlegend=True)
         # Save dashboard
         path = os.path.join(self.dir_dashboard, f'{self.tickers_path[ticker]}_dashboard.html')
-        self.fig.write_html(path)
-        self.dashboard_draw()
+        self.dashboard_data.write_html(path)
+        self.dashboard_data_draw()
 
     def create_data_dashboard(self, ticker: str) -> None:
         """Create dashboard showing data accumulation and quality metrics"""
@@ -199,7 +200,7 @@ class DataProvider:
         df = self.data_processed[ticker]
         metrics = self.metrics_history[self.metrics_history['ticker'] == ticker]
         # Create subplots
-        self.fig = make_subplots(
+        self.dashboard_data = make_subplots(
             rows=3, cols=2,
             subplot_titles=(
                 'Price History',
@@ -209,7 +210,7 @@ class DataProvider:
                 'Volatility',
                 'Missing Data Points'))
         # 1. Price History
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Candlestick(
                 x=df.index,
                 open=df['Open'],
@@ -220,45 +221,159 @@ class DataProvider:
             row=1, col=1)
         # 2. Data Quality Metrics
         for metric in ['missing_values', 'outliers', 'high_dispersion']:
-            self.fig.add_trace(
+            self.dashboard_data.add_trace(
                 go.Scatter(
                     x=metrics['timestamp'],
                     y=metrics[metric],
                     name=metric),
                 row=1, col=2)
         # 3. Technical Indicators
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Scatter(x=df.index, y=df['SMA_20'], name='SMA 20'),
             row=2, col=1)
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Scatter(x=df.index, y=df['RSI'], name='RSI'),
             row=2, col=1)
         # 4. Volume Profile
         if 'Volume' in df.columns:
-            self.fig.add_trace(
+            self.dashboard_data.add_trace(
                 go.Bar(x=df.index, y=df['Volume'], name='Volume'),
                 row=2, col=2)
         # 5. Volatility
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Scatter(x=df.index, y=df['ATR'], name='ATR'),
             row=3, col=1)
         # 6. Missing Data Points
         missing_data = df.isnull().sum(axis=1)
-        self.fig.add_trace(
+        self.dashboard_data.add_trace(
             go.Scatter(x=df.index, y=missing_data, name='Missing Points'),
             row=3, col=2)
         # Update layout
-        self.fig.update_layout(
+        self.dashboard_data.update_layout(
             height=1200,
             width=1600,
             title_text=f"Data Analysis Dashboard - {ticker}",
             showlegend=True)
         # Save the dashboard
-        self.fig.write_html(os.path.join(self.dir_metrics, f'{ticker.replace("/", "_")}_dashboard.html'))
+        self.dashboard_data.write_html(os.path.join(self.dir_metrics, f'{ticker.replace("/", "_")}_dashboard.html'))
 
-    def dashboard_draw(self):
-        self.fig.update_layout(height=800, width=1200, title_text='')
-        self.fig.show()
+    def create_features_dashboard(self, ticker: str) -> None:
+        """Create dashboard showing technical analysis features"""
+        if ticker not in self.data_processed or self.data_processed[ticker] is None:
+            print(f"No processed data available for {ticker}")
+            return
+
+        df = self.data_processed[ticker]
+        
+        # Create subplots
+        self.dashboard_features = make_subplots(
+            rows=4, cols=2,
+            subplot_titles=(
+                'Price and Moving Averages',
+                'Returns Distribution',
+                'RSI and MACD',
+                'Volume Analysis',
+                'Volatility Metrics',
+                'Moving Average Comparison',
+                'Log Returns',
+                'Volume Z-Score'
+            ),
+            vertical_spacing=0.1,
+            horizontal_spacing=0.1)
+
+        # 1. Price and Moving Averages
+        self.dashboard_features.add_trace(
+            go.Candlestick(
+                x=df.index,
+                open=df['Open'],
+                high=df['High'],
+                low=df['Low'],
+                close=df['Close'],
+                name='OHLC'),
+            row=1, col=1)
+        
+        # Add SMA lines
+        for period in [20, 50, 200]:
+            self.dashboard_features.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df[f'SMA_{period}'],
+                    name=f'SMA {period}'),
+                row=1, col=1)
+
+        # 2. Returns Distribution
+        self.dashboard_features.add_trace(
+            go.Histogram(
+                x=df['Returns'],
+                name='Returns Distribution',
+                nbinsx=50),
+            row=1, col=2)
+
+        # 3. RSI and MACD
+        self.dashboard_features.add_trace(
+            go.Scatter(x=df.index, y=df['RSI'], name='RSI'),
+            row=2, col=1)
+        self.dashboard_features.add_trace(
+            go.Scatter(x=df.index, y=df['MACD'], name='MACD'),
+            row=2, col=1)
+        self.dashboard_features.add_trace(
+            go.Scatter(x=df.index, y=df['MACD_Signal'], name='MACD Signal'),
+            row=2, col=1)
+
+        # 4. Volume Analysis
+        if 'Volume' in df.columns:
+            self.dashboard_features.add_trace(
+                go.Bar(x=df.index, y=df['Volume'], name='Volume'),
+                row=2, col=2)
+            self.dashboard_features.add_trace(
+                go.Scatter(x=df.index, y=df['Volume_MA'], name='Volume MA'),
+                row=2, col=2)
+
+        # 5. Volatility Metrics
+        self.dashboard_features.add_trace(
+            go.Scatter(x=df.index, y=df['ATR'], name='ATR'),
+            row=3, col=1)
+        self.dashboard_features.add_trace(
+            go.Scatter(x=df.index, y=df['Volatility'], name='Volatility'),
+            row=3, col=1)
+
+        # 6. Moving Average Comparison
+        for period in [5, 10, 20]:
+            self.dashboard_features.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df[f'EMA_{period}'] - df[f'SMA_{period}'],
+                    name=f'EMA-SMA {period}'),
+                row=3, col=2)
+
+        # 7. Log Returns
+        self.dashboard_features.add_trace(
+            go.Scatter(x=df.index, y=df['Log_Returns'], name='Log Returns'),
+            row=4, col=1)
+
+        # 8. Volume Z-Score
+        if 'Volume_ZScore' in df.columns:
+            self.dashboard_features.add_trace(
+                go.Scatter(x=df.index, y=df['Volume_ZScore'], name='Volume Z-Score'),
+                row=4, col=2)
+
+        # Update layout
+        self.dashboard_features.update_layout(
+            height=1600,
+            width=1600,
+            title_text=f"Technical Analysis Features Dashboard - {ticker}",
+            showlegend=True)
+
+        # Save the dashboard
+        self.dashboard_features.write_html(os.path.join(self.dir_dashboard, f'{self.tickers_path[ticker]}_features_dashboard.html'))
+
+    def dashboard_data_draw(self):
+        self.dashboard_data.update_layout(height=800, width=1200, title_text='')
+        self.dashboard_data.show()
+
+    def dashboard_features_draw(self):
+        self.dashboard_features.update_layout(height=800, width=1200, title_text='')
+        self.dashboard_features.show()
 #endregion
 
 #region Utility
@@ -287,6 +402,7 @@ class DataProvider:
                 self.data_processed[ticker] = self.process_new_data(ticker, df)
                 # Update dashboard
                 self.create_data_dashboard(ticker)
+                self.create_features_dashboard(ticker)
         return bool(self.data_processed)
 
     def data_load_by_ticker(self, ticker):
@@ -406,8 +522,9 @@ class DataProvider:
             new_data = self.data_request_by_ticker(ticker, ts)
             self.data[ticker] = new_data
             self.data_processed[ticker] = self.process_new_data(ticker, new_data)
-            # Update dashboard
+            # Update dashboards
             self.create_data_dashboard(ticker)
+            self.create_features_dashboard(ticker)
 
     def data_request_by_ticker(self, ticker, ts: dt.date = None) -> Optional[pd.DataFrame]:
         """Request new data for a ticker and process it through the pipeline"""
@@ -427,8 +544,9 @@ class DataProvider:
                 existing_data = self.data[ticker] if ticker in self.data else None
                 self.data[ticker] = self.data_append(existing_data, new_data)
                 self.data_processed[ticker] = self.process_new_data(ticker, new_data)
-                # Update dashboard
+                # Update dashboards
                 self.create_data_dashboard(ticker)
+                self.create_features_dashboard(ticker)
 
     def process_new_data(self, ticker, new_data: pd.DataFrame):
         # Load existing data if any
@@ -447,4 +565,5 @@ class DataProvider:
             new_data = new_data[~new_data.index.duplicated(keep='last')]
             new_data = new_data.sort_index()
         return new_data
+
 #endregion
