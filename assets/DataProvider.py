@@ -21,7 +21,8 @@ class DataProvider:
                         ts: dt.date = None,
                         te: dt.date = None,
                         outlier_std_threshold: float = 5.0,
-                        gap_fill_limit: int = 20):
+                        gap_fill_limit: int = 20,
+                        skip_dashboard: bool = False):
         self.tickers: List[str] = tickers
         self.tickers_path: Dict[str, str] = {ticker: ticker.replace('/', '_') for ticker in tickers}
         self.resolution: DataResolution = resolution
@@ -50,7 +51,7 @@ class DataProvider:
         else:
             self.metrics_history = pd.DataFrame(columns=[
                 'timestamp', 'ticker', 'total_rows', 'missing_values',
-                'outliers_removed', 'gaps_filled', 'high_dispersion_removed'
+                'outliers', 'gaps_filled', 'high_dispersion'
             ])
 
 #region Feature Engineering        
@@ -109,24 +110,26 @@ class DataProvider:
 #endregion
 
 #region Dashboard
-    def record_metrics(self, ticker: str, df: pd.DataFrame, initial_rows: int, initial_missing: int) -> None:
-        """Record data quality metrics"""
-        metrics = {
-            'timestamp': pd.Timestamp.now(),
-            'ticker': ticker,
-            'total_rows': len(df),
-            'missing_values': df.isnull().sum().sum(),
-            'outliers_removed': initial_rows - len(df),
-            'gaps_filled': df.isnull().sum().sum() - initial_missing,
-            'high_dispersion_removed': sum((df['High'] - df['Low']) / df['Close'] > 0.1)
-        }
-        self.metrics_history = pd.concat([
-            self.metrics_history,
-            pd.DataFrame([metrics])
-        ], ignore_index=True)
-        # Save metrics
+    def record_metrics(self, ticker: str, df: pd.DataFrame, initial_rows: int, initial_missing: int):
+        # Record data quality metrics
+        current_rows = len(df) if df is not None else 0
+        current_missing = df.isnull().sum().sum() if df is not None else 0
+        
+        new_metrics = pd.DataFrame({
+            'timestamp': [pd.Timestamp.now()],
+            'ticker': [ticker],
+            'total_rows': [current_rows],
+            'missing_values': [current_missing],
+            'outliers': [initial_rows - current_rows if initial_rows > current_rows else 0],
+            'gaps_filled': [initial_missing - current_missing if initial_missing > current_missing else 0],
+            'high_dispersion': [0]  # This will be updated by clean_data
+        })
+        
+        self.metrics_history = pd.concat([self.metrics_history, new_metrics], ignore_index=True)
         self.metrics_history.to_csv(self.metrics_file, index=False)
         
+        return new_metrics
+
     def update_dashboard(self, ticker: str, df: pd.DataFrame) -> None:
         """Update dashboard for a ticker"""
         if df is None or df.empty:
@@ -162,11 +165,21 @@ class DataProvider:
         self.dashboard_data.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'), row=1, col=2)
         self.dashboard_data.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD'), row=1, col=2)
         # 3. Data Quality Metrics
-        metrics = self.metrics_history[self.metrics_history['ticker'] == ticker]
-        for col in ['missing_values', 'outliers_removed', 'gaps_filled']:
-            self.dashboard_data.add_trace(
-                go.Scatter(x=metrics['timestamp'], y=metrics[col], name=col),
-                row=2, col=1)
+        if not self.metrics_history.empty:
+            ticker_metrics = self.metrics_history[self.metrics_history['ticker'] == ticker]
+            if not ticker_metrics.empty:
+                metrics = ticker_metrics.iloc[-1]
+                for metric in ['total_rows', 'missing_values', 'outliers', 'gaps_filled', 'high_dispersion']:
+                    if metric in metrics:
+                        self.dashboard_data.add_trace(
+                            go.Scatter(
+                                x=[metrics['timestamp']],
+                                y=metrics[metric],
+                                name=metric,
+                                mode='lines+markers'
+                            ),
+                            row=2, col=1
+                        )
         # 4. Returns Distribution
         self.dashboard_data.add_trace(
             go.Histogram(x=df['Returns'], name='Returns Distribution', nbinsx=50),
@@ -432,6 +445,7 @@ class DataProvider:
         """Process data through cleaning and feature engineering pipeline"""
         if df is None or df.empty:
             return df
+        df.columns = [x.capitalize() for x in df.columns]
         # Store initial state for metrics
         initial_rows = len(df)
         initial_missing = df.isnull().sum().sum()
@@ -449,13 +463,20 @@ class DataProvider:
             df = self.clean_data_for_ticker(ticker, df)
             self.data[ticker] = df
 
-    def clean_data_for_ticker(self, ticker: str = None, df: pd.DataFrame = None) -> pd.DataFrame:
-        def drop_nones(ticker: str, df:  pd.DataFrame):
-            # Удаляем пропуски (None)
-            initial_length = len(df)
+    def clean_data_for_ticker(self, ticker: str = None, df: pd.DataFrame = None):
+        if df is None:
+            return None
+            
+        initial_rows = len(df)
+        initial_missing = df.isnull().sum().sum()
+        
+        def drop_nones(ticker: str, df: pd.DataFrame):
+            if df is None or df.empty:
+                return df
             df = df.dropna()
-            if len(df) != initial_length:
-                print(f' Удалено {initial_length - len(df)} пустых значений для {ticker}')
+            rows_dropped = initial_rows - len(df)
+            if rows_dropped > 0:
+                logging.info(f'Dropped {rows_dropped} rows with None values for {ticker}')
             return df
 
         def drop_high_dispersion(ticker: str, df: pd.DataFrame, threshold: float = 0.5) -> None:
@@ -525,12 +546,16 @@ class DataProvider:
 
     def data_request(self, ts: dt.date = None):
         for ticker in self.tickers:
-            new_data = self.data_request_by_ticker(ticker, ts)
-            self.data[ticker] = new_data
-            self.data_processed[ticker] = self.process_new_data(ticker, new_data)
-            # Update dashboards
-            self.create_data_dashboard(ticker)
-            self.create_features_dashboard(ticker)
+            try:
+                new_data = self.data_request_by_ticker(ticker, ts)
+                if new_data is not None and not new_data.empty:
+                    self.data[ticker] = new_data
+                    self.data_processed[ticker] = self.process_new_data(ticker, new_data)
+                    # Record initial metrics
+                    self.record_metrics(ticker, new_data, len(new_data), new_data.isnull().sum().sum())
+            except Exception as e:
+                logging.error(f"Error processing {ticker}: {str(e)}")
+                continue
 
     def data_request_by_ticker(self, ticker, ts: dt.date = None) -> Optional[pd.DataFrame]:
         """Request new data for a ticker and process it through the pipeline"""
@@ -563,6 +588,8 @@ class DataProvider:
         existing_data = None
         if ticker in self.data:
             existing_data = self.data[ticker]
+            if existing_data is not None:
+                existing_data.columns = [x.capitalize() for x in existing_data.columns]
         # Process new data
         processed_data = self.process_data(ticker, new_data)
         # Merge with existing data if any

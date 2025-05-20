@@ -7,3 +7,6 @@ backtesting
 scikit-learn
 plotly
 finplot
+lightgbm
+ta
+streamlit
