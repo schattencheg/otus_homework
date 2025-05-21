@@ -1,18 +1,23 @@
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import ta
 import streamlit as st
 from datetime import datetime, timedelta
 from assets.DataProvider import DataProvider
+import torch
+import torch.nn as nn
+from assets.tsmixer import TSMixer
 
 class HW5_ML_Strategy:
     def __init__(self, symbol='BTC/USDT', timeframe='1h'):
         self.symbol = symbol
         self.timeframe = timeframe
         self.model = None
+        self.scaler = StandardScaler()
+        self.sequence_length = 24  # Look back period for time series
         # Initialize data provider with dashboard disabled to avoid errors
         self.data_provider = DataProvider(tickers=[symbol], skip_dashboard=True)
         try:
@@ -21,6 +26,9 @@ class HW5_ML_Strategy:
             print(f"Error loading data: {str(e)}")
             raise
         self.metrics = {}
+        
+        # Initialize TSMixer model
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     def prepare_features(self, df):
         # Add technical indicators
@@ -35,7 +43,23 @@ class HW5_ML_Strategy:
         # Drop NaN values
         df.dropna(inplace=True)
         
+        # Scale features
+        features = ['rsi', 'macd', 'bb_high', 'bb_low', 'open', 'high', 'low', 'close', 'volume']
+        df[features] = self.scaler.fit_transform(df[features])
+        
         return df
+    
+    def create_sequences(self, data):
+        sequences = []
+        targets = []
+        
+        for i in range(len(data) - self.sequence_length):
+            seq = data[i:(i + self.sequence_length)]
+            target = data.iloc[i + self.sequence_length]['target']
+            sequences.append(seq)
+            targets.append(target)
+            
+        return torch.FloatTensor(np.array(sequences)), torch.LongTensor(targets)
     
     def train(self, start_date, end_date):
         try:
@@ -65,23 +89,61 @@ class HW5_ML_Strategy:
         # Prepare features and target
         features = ['rsi', 'macd', 'bb_high', 'bb_low', 'open', 'high', 'low', 'close', 'volume']
         X = df[features]
-        y = df['target']
+        
+        # Create sequences for TSMixer
+        X_seq, y_seq = self.create_sequences(df)
         
         # Split data
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
+        train_size = int(len(X_seq) * 0.8)
+        X_train, X_val = X_seq[:train_size], X_seq[train_size:]
+        y_train, y_val = y_seq[:train_size], y_seq[train_size:]
         
-        # Train model
-        self.model = lgb.LGBMClassifier(n_estimators=100, random_state=42)
-        self.model.fit(X_train, y_train)
+        # Move data to device
+        X_train = X_train.to(self.device)
+        y_train = y_train.to(self.device)
+        X_val = X_val.to(self.device)
+        y_val = y_val.to(self.device)
         
-        # Calculate metrics
-        y_pred = self.model.predict(X_val)
-        self.metrics = {
-            'accuracy': accuracy_score(y_val, y_pred),
-            'precision': precision_score(y_val, y_pred),
-            'recall': recall_score(y_val, y_pred),
-            'f1': f1_score(y_val, y_pred)
-        }
+        # Initialize TSMixer model
+        self.model = TSMixer(
+            input_size=len(features),
+            hidden_size=64,
+            num_layers=2,
+            seq_len=self.sequence_length,
+            num_classes=2
+        ).to(self.device)
+        
+        # Training parameters
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        num_epochs = 50
+        
+        # Training loop
+        self.model.train()
+        for epoch in range(num_epochs):
+            optimizer.zero_grad()
+            outputs = self.model(X_train)
+            loss = criterion(outputs, y_train)
+            loss.backward()
+            optimizer.step()
+            
+            if (epoch + 1) % 10 == 0:
+                print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+        
+        # Evaluation
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(X_val)
+            _, predicted = torch.max(outputs.data, 1)
+            y_pred = predicted.cpu().numpy()
+            y_true = y_val.cpu().numpy()
+            
+            self.metrics = {
+                'accuracy': accuracy_score(y_true, y_pred),
+                'precision': precision_score(y_true, y_pred),
+                'recall': recall_score(y_true, y_pred),
+                'f1': f1_score(y_true, y_pred)
+            }
         
         return self.metrics
     
@@ -114,10 +176,21 @@ class HW5_ML_Strategy:
         df = self.prepare_features(df)
         
         features = ['rsi', 'macd', 'bb_high', 'bb_low', 'open', 'high', 'low', 'close', 'volume']
-        X = df[features]
         
-        # Generate predictions
-        df['prediction'] = self.model.predict(X)
+        # Create sequences for prediction
+        predictions = []
+        for i in range(self.sequence_length, len(df)):
+            seq = df[features].iloc[i-self.sequence_length:i].values
+            seq_tensor = torch.FloatTensor(seq).unsqueeze(0).to(self.device)
+            
+            with torch.no_grad():
+                output = self.model(seq_tensor)
+                _, predicted = torch.max(output.data, 1)
+                predictions.append(predicted.item())
+        
+        # Add predictions to dataframe
+        df = df.iloc[self.sequence_length:].copy()
+        df['prediction'] = predictions
         
         # Simulate trading
         balance = initial_balance

@@ -10,3 +10,4 @@ finplot
 lightgbm
 ta
 streamlit
+torch
