@@ -407,6 +407,21 @@ class DataProvider:
 #endregion
 
 #region Data Processing
+    def get_data(self, ticker):
+        result: pd.DataFrame = None
+        if ticker not in self.data:
+            if ticker not in self.tickers:
+                self.tickers.append(ticker)
+            df = self.data_load_by_ticker(ticker)
+            if df is not None:
+                result = df
+            else:
+                self.data_request()
+                if ticker in self.data:
+                    result = self.data[ticker]
+                    self.data_save()
+        return result
+
     def data_load(self):
         for ticker in self.tickers:
             df = self.data_load_by_ticker(ticker)
