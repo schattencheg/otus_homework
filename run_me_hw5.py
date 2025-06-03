@@ -144,7 +144,7 @@ class Strategy_HW2:
     def evaluate_strategy(self, params):
         trades = self.get_trades('SMA', HW2Strategy_SMA, params)
         return trades
-
+    
     @property
     def data(self):
         return self.data_provider.data[self.ticker]
@@ -280,7 +280,12 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     # 7. Test models
     for model in models:
         test_model(models[model]['title'], models[model]['model_trained'], dataloader)
-    
+    # 8. Save models
+    for model in models:
+        torch.save(models[model]['model_trained'].state_dict(), f"{model}_model_trained.pt")
+    # 9. Run models over real strategy
+    for model in models:
+        strategy = HW2Strategy_SMA(params=[model])
 
 def train_model(title, model, dataloader, num_epochs=10):
     criterion = nn.CrossEntropyLoss()
@@ -316,7 +321,6 @@ def train_model(title, model, dataloader, num_epochs=10):
     plt.ylabel("Signal (0=Sell, 1=Hold, 2=Buy)")
     plt.legend()
     plt.show()
-
 
 def test_model(title, model, dataloader):
     all_predictions = []

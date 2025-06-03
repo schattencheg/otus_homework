@@ -177,3 +177,5 @@ backtesting/
 dashboard/
 
 results/
+
+*.pt
