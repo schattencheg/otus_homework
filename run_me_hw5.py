@@ -2,7 +2,9 @@
 #%pip install nbformat
 from matplotlib import pyplot as plt
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -149,15 +151,16 @@ class Strategy_HW2:
 
 
 class StockCNN(nn.Module):
-    def __init__(self, kernel_size_conv1=3, kernel_size_conv2=3, window_size=30):
+    def __init__(self, input_channels, window_size, kernel_size_conv1=3, kernel_size_conv2=3):
         super(StockCNN, self).__init__()
-        self.conv1 = nn.Conv1d(5, 16, kernel_size=kernel_size_conv1)  # Input: 5 channels, Output: 16 channels
+        self.conv1 = nn.Conv1d(input_channels, 16, kernel_size=kernel_size_conv1)  # Input: dynamic channels, Output: 16 channels
         self.conv2 = nn.Conv1d(16, 32, kernel_size=kernel_size_conv2)  # Input: 16 channels, Output: 32 channels
         self.fc1 = nn.Linear(32 * (window_size - (kernel_size_conv1 - 1) -(kernel_size_conv2 - 1)), 64)  # Flattened size after conv
         self.fc2 = nn.Linear(64, 3)  # Output: 3 classes (Buy, Hold, Sell)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)  # Permute to (batch_size, channels, sequence_length) -> [32, 5, 30]
+        # Input x shape: (batch_size, window_size, num_features)
+        x = x.permute(0, 2, 1)  # Permute to (batch_size, num_features, window_size)
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
         x = x.view(x.size(0), -1)  # Flatten the output from convolution layers
@@ -166,7 +169,7 @@ class StockCNN(nn.Module):
 
 
 class StockLSTM(nn.Module):
-    def __init__(self, input_size=5, hidden_size=64, num_layers=2):
+    def __init__(self, input_size, hidden_size=64, num_layers=2):
         super(StockLSTM, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, 3)
@@ -178,7 +181,7 @@ class StockLSTM(nn.Module):
 
 
 class StockGRU(nn.Module):
-    def __init__(self, input_size=5, hidden_size=64, num_layers=2):
+    def __init__(self, input_size, hidden_size=64, num_layers=2):
         super(StockGRU, self).__init__()
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, 3)
@@ -190,9 +193,9 @@ class StockGRU(nn.Module):
 
 
 class StockCNN_LSTM(nn.Module):
-    def __init__(self):
+    def __init__(self, input_channels):
         super(StockCNN_LSTM, self).__init__()
-        self.conv1 = nn.Conv1d(5, 16, kernel_size=3)  # Input: 5 channels, Output: 16 channels
+        self.conv1 = nn.Conv1d(input_channels, 16, kernel_size=3)  # Input: dynamic channels, Output: 16 channels
         self.conv2 = nn.Conv1d(16, 32, kernel_size=3)  # Input: 16 channels, Output: 32 channels
 
         self.lstm = nn.LSTM(input_size=32, hidden_size=64, num_layers=1, batch_first=True)
@@ -200,7 +203,8 @@ class StockCNN_LSTM(nn.Module):
         self.fc1 = nn.Linear(64, 3)  # Output: 3 classes (Buy, Hold, Sell)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)  # Permute to (batch_size, channels, sequence_length) -> [batch, 5, window_size]
+        # Input x shape: (batch_size, window_size, num_features)
+        x = x.permute(0, 2, 1)  # Permute to (batch_size, num_features, window_size) for Conv1d
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
         x = x.permute(0, 2, 1)  # Reshape for LSTM: [batch, seq_length, features]
@@ -227,7 +231,9 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     data = data_provider.data[ticker]
     # 2. Add features
     features_generator = FeaturesGenerator()
-    data, _ = features_generator.prepare_features(data)
+    data, feature_names = features_generator.prepare_features(data)
+    num_features = data.shape[1]
+    print(f"Number of features generated: {num_features} ({len(feature_names)} names)")
     # 3. Generate target
     # 3.1. Generate trades, using homework 2 (only long)
     strategy_hw2 = Strategy_HW2(ticker, timeframe, data_provider)
@@ -247,23 +253,23 @@ def main(ticker='BTC/USDT', timeframe='1h'):
         X.append(data.iloc[i:i + window_size].values)
         y.append(y_base[i])
     # Now convert lists to tensors
-    X = torch.tensor(X, dtype=torch.float32)
+    X = torch.tensor(np.array(X), dtype=torch.float32)
     y = torch.tensor(y, dtype=torch.long)
     # DataLoader
     dataset = TensorDataset(X, y)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     # 5. Create models
-    models = {'CNN': {  'model': StockCNN(window_size=window_size), 
+    models = {'CNN': {  'model': StockCNN(input_channels=num_features, window_size=window_size), 
                         'title': 'CNN model Predictions vs. Actual',
                         'model_trained': None},
-              'LSTM': { 'model': StockLSTM(), 
+              'LSTM': { 'model': StockLSTM(input_size=num_features), 
                         'title': 'LSTM model Predictions vs. Actual',
                         'model_trained': None},
-              'GRU': {  'model': StockGRU(), 
+              'GRU': {  'model': StockGRU(input_size=num_features), 
                         'title': 'GRU model Prediction vs. Actual',
                         'model_trained': None},
-              'CNN-LSTM': { 'model': StockCNN_LSTM(), 
+              'CNN-LSTM': { 'model': StockCNN_LSTM(input_channels=num_features), 
                             'title': 'CNN-LSTM model Prediction vs. Actual',
                             'model_trained': None}}
     
