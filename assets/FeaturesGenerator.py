@@ -102,6 +102,42 @@ class FeaturesGenerator:
             # Gap feature
             df['Open_vs_Prev_Close'] = df['Open'] - df['Close'].shift(1)
 
+            # Time-based Features (assuming df.index is DatetimeIndex)
+            if isinstance(df.index, pd.DatetimeIndex):
+                df['Day_Of_Week'] = df.index.dayofweek
+                df['Month_Of_Year'] = df.index.month
+                df['Week_Of_Year'] = df.index.isocalendar().week.astype(int)
+                df['Quarter'] = df.index.quarter
+
+            # Lagged Features
+            for lag in [1, 2, 3]:
+                df[f'Returns_Lag_{lag}'] = df['Returns'].shift(lag)
+            df['Log_Returns_Lag_1'] = df['Log_Returns'].shift(1)
+            if 'Volatility' in df.columns:
+                 df['Volatility_Lag_1'] = df['Volatility'].shift(1)
+
+            # Volatility Variations
+            if 'Daily_Range' in df.columns:
+                df['Daily_Range_MA_10'] = df['Daily_Range'].rolling(window=10).mean()
+                df['Daily_Range_Std_10'] = df['Daily_Range'].rolling(window=10).std()
+                df['Daily_Range_vs_MA_10'] = df['Daily_Range'] / df['Daily_Range_MA_10'].replace(0, np.nan)
+            if 'ATR' in df.columns:
+                df['ATR_Normalized'] = df['ATR'] / df['Close'].replace(0, np.nan)
+
+            # Trend/Momentum Variations
+            if 'SMA_20' in df.columns:
+                df['SMA_20_Slope'] = df['SMA_20'].diff()
+            if 'EMA_10' in df.columns:
+                df['EMA_10_Slope'] = df['EMA_10'].diff()
+            if 'SMA_5' in df.columns and 'SMA_20' in df.columns:
+                df['Price_Oscillator_5_20'] = df['SMA_5'] - df['SMA_20']
+
+            # Interaction Features
+            if 'RSI' in df.columns and 'Volume_ZScore' in df.columns and 'Volume' in df.columns:
+                df['RSI_x_Volume_ZScore'] = df['RSI'] * df['Volume_ZScore']
+            if 'MACD' in df.columns and 'RSI' in df.columns:
+                df['MACD_x_RSI'] = df['MACD'] * df['RSI']
+
             # Drop NaN values introduced by rolling windows, shifts, and calculations
             df = df.dropna()
 
@@ -142,6 +178,36 @@ class FeaturesGenerator:
                 f'Close_vs_Rolling_Max_{rolling_window_new}', f'Close_vs_Rolling_Min_{rolling_window_new}'
             ])
             feature_columns.extend(new_feature_names)
+
+            # Add even more trading features to the list
+            additional_trading_features = []
+            if isinstance(df.index, pd.DatetimeIndex):
+                additional_trading_features.extend(['Day_Of_Week', 'Month_Of_Year', 'Week_Of_Year', 'Quarter'])
+            
+            for lag in [1, 2, 3]:
+                additional_trading_features.append(f'Returns_Lag_{lag}')
+            additional_trading_features.append('Log_Returns_Lag_1')
+            if 'Volatility' in df.columns: # Check if base feature exists
+                 additional_trading_features.append('Volatility_Lag_1')
+
+            if 'Daily_Range' in df.columns:
+                additional_trading_features.extend(['Daily_Range_MA_10', 'Daily_Range_Std_10', 'Daily_Range_vs_MA_10'])
+            if 'ATR' in df.columns:
+                additional_trading_features.append('ATR_Normalized')
+
+            if 'SMA_20' in df.columns:
+                additional_trading_features.append('SMA_20_Slope')
+            if 'EMA_10' in df.columns:
+                additional_trading_features.append('EMA_10_Slope')
+            if 'SMA_5' in df.columns and 'SMA_20' in df.columns:
+                additional_trading_features.append('Price_Oscillator_5_20')
+
+            if 'RSI' in df.columns and 'Volume_ZScore' in df.columns and 'Volume' in df.columns:
+                additional_trading_features.append('RSI_x_Volume_ZScore')
+            if 'MACD' in df.columns and 'RSI' in df.columns:
+                additional_trading_features.append('MACD_x_RSI')
+            
+            feature_columns.extend(additional_trading_features)
             
             # Prepare feature matrix
             X = df[feature_columns].copy()

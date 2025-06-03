@@ -229,47 +229,52 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     features_generator = FeaturesGenerator()
     data, _ = features_generator.prepare_features(data)
     # 3. Generate target
-    # 3.1. Generate trades, using homework 2
+    # 3.1. Generate trades, using homework 2 (only long)
     strategy_hw2 = Strategy_HW2(ticker, timeframe, data_provider)
     strategy_hw2.evaluate_strategies()
     trades_sma = strategy_hw2.trades_sma
     params_sma = strategy_hw2.params_sma
     # 3.2. Extract data for ML
-    trades_return_pct = trades_sma['ReturnPct'].values
-    y = [1 if x > threshold else 0 for x in trades_return_pct]
     # Add PnL and Returns from strategy run
+    trades_sma = trades_sma.set_index('EntryTime')
     data_extended = pd.concat([data, trades_sma[['PnL', 'ReturnPct']]], axis=1)
+    trades_return_pct = data_extended['ReturnPct'].values
+    y_base = [1 if x > threshold else 0 for x in trades_return_pct]
     # 4. Dataset generation
     window_size = 30
     X, y = [], []
     for i in range(len(data) - window_size - 1):
         X.append(data.iloc[i:i + window_size].values)
-        
-        # Define labels based on Close price comparison for the window
-        if data['Close'].iloc[i + window_size] > data['Close'].iloc[i + window_size - 1]:
-            y.append(2)  # Buy
-        elif data['Close'].iloc[i + window_size] < data['Close'].iloc[i + window_size - 1]:
-            y.append(0)  # Sell
-        else:
-            y.append(1)  # Hold
-
+        y.append(y_base[i])
     # Now convert lists to tensors
     X = torch.tensor(X, dtype=torch.float32)
     y = torch.tensor(y, dtype=torch.long)
-
     # DataLoader
     dataset = TensorDataset(X, y)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     # 5. Create models
-    models = {'CNN': {'model': StockCNN(window_size=window_size), 'title': 'CNN model Predictions vs. Actual'},
-              'LSTM': {'model': StockLSTM(), 'title': 'LSTM model Predictions vs. Actual'},
-              'GRU': {'model': StockGRU(), 'title': 'GRU model Prediction vs. Actual'},
-              'CNN-LSTM': {'model': StockCNN_LSTM(), 'title': 'CNN-LSTM model Prediction vs. Actual'}}
+    models = {'CNN': {  'model': StockCNN(window_size=window_size), 
+                        'title': 'CNN model Predictions vs. Actual',
+                        'model_trained': None},
+              'LSTM': { 'model': StockLSTM(), 
+                        'title': 'LSTM model Predictions vs. Actual',
+                        'model_trained': None},
+              'GRU': {  'model': StockGRU(), 
+                        'title': 'GRU model Prediction vs. Actual',
+                        'model_trained': None},
+              'CNN-LSTM': { 'model': StockCNN_LSTM(), 
+                            'title': 'CNN-LSTM model Prediction vs. Actual',
+                            'model_trained': None}}
     
     # 6. Train models
+    for model in models:
+        model_trained = train_model(models[model]['title'], models[model]['model'], dataloader)
+        models[model]['model_trained'] = model_trained
     # 7. Test models
-
+    for model in models:
+        test_model(models[model]['title'], models[model]['model_trained'], dataloader)
+    
 
 def train_model(title, model, dataloader, num_epochs=10):
     criterion = nn.CrossEntropyLoss()
@@ -305,6 +310,33 @@ def train_model(title, model, dataloader, num_epochs=10):
     plt.ylabel("Signal (0=Sell, 1=Hold, 2=Buy)")
     plt.legend()
     plt.show()
+
+
+def test_model(title, model, dataloader):
+    all_predictions = []
+    all_targets = []
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+            all_predictions.extend(predicted.numpy())
+            all_targets.extend(targets.numpy())
+    
+    # Calculate accuracy
+    accuracy = accuracy_score(all_targets, all_predictions)
+    print(f"{title} Accuracy: {accuracy:.4f}")
+    
+    # Plot actual vs predicted labels
+    plt.figure(figsize=(12, 6))
+    plt.plot(all_targets[-30:], label='Actual', color='blue', linestyle='--', alpha=0.7)
+    plt.plot(all_predictions[-30:], label='Predicted', color='red', alpha=0.7)
+    plt.title(title)
+    plt.xlabel("Time Step")
+    plt.ylabel("Signal (0=Sell, 1=Hold, 2=Buy)")
+    plt.legend()
+    plt.show()
+    
+    return accuracy
 
 if __name__ == "__main__":
     ticker = 'BTC/USDT'
