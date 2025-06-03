@@ -18,8 +18,6 @@ class HW2Backtest:
         self.data = data
         self.data.columns = [x.title() for x in self.data.columns]
         self.train_data, self.validation_data = train_test_split(data, test_size=0.3, shuffle=False)
-        #self.test_data, self.validation_data = train_test_split(self.test_val_data, test_size=0.5, shuffle=False)
-        #stop_here = True
 
     def backtest_strategy(self, data: pd.DataFrame, strategy_class, params: Dict[str, Any]) -> Dict[str, float]:
         bt = Backtest(data, strategy_class, cash=10000000, commission=.002)
