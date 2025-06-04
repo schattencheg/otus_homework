@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
+import traceback
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,8 +13,18 @@ from torch.utils.data import DataLoader, TensorDataset
 from assets.DataProvider import DataProvider
 from assets.HW2Backtest import HW2Backtest
 from assets.enums import DataPeriod, DataResolution
-from backtesting import Strategy
+from backtesting import Strategy, Backtest
 from assets.FeaturesGenerator import FeaturesGenerator
+
+import numpy as np # Make sure numpy is imported
+
+def create_sequences(data_values, target_values, window_size):
+    X, y = [], []
+    for i in range(len(data_values) - window_size):
+        X.append(data_values[i:(i + window_size)])
+        y.append(target_values[i + window_size])
+    return np.array(X), np.array(y)
+
 
 
 class HW2Strategy_SMA(Strategy):
@@ -218,6 +229,7 @@ class StockCNN_LSTM(nn.Module):
 
 def main(ticker='BTC/USDT', timeframe='1h'):
     # 0. Initial parameters
+    best_params_sma = {} # Initialize to handle cases where SMA optimization might be skipped
     ticker = ticker
     timeframe = timeframe
     threshold = 0.2
@@ -231,8 +243,9 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     data = data_provider.data[ticker]
     # 2. Add features
     features_generator = FeaturesGenerator()
-    data, feature_names = features_generator.prepare_features(data)
-    num_features = data.shape[1]
+    data_initial_ohlc = data.copy()  # Store a true copy of original OHLC data
+    data, feature_matrix, feature_names = features_generator.prepare_features(data_initial_ohlc) # Pass original; 'data' is now data_ohlc_aligned_with_features
+    num_features = feature_matrix.shape[1]
     print(f"Number of features generated: {num_features} ({len(feature_names)} names)")
     # 3. Generate target
     # 3.1. Generate trades, using homework 2 (only long)
@@ -242,24 +255,40 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     params_sma = strategy_hw2.params_sma
     # 3.2. Extract data for ML
     # Add PnL and Returns from strategy run
-    trades_sma = trades_sma.set_index('EntryTime')
-    data_extended = pd.concat([data, trades_sma[['PnL', 'ReturnPct']]], axis=1)
+    # 'data' here is data_ohlc_aligned_with_features (from prepare_features output), which is correctly aligned for y_base
+    data_extended = data.copy() 
+
+    if trades_sma is None or trades_sma.empty:
+        print("WARN: No trades from SMA strategy. PnL and ReturnPct will be zero for y_base generation.")
+        data_extended['PnL'] = 0.0
+        data_extended['ReturnPct'] = 0.0
+    else:
+        trades_sma = trades_sma.set_index('EntryTime')
+        # Merge PnL and ReturnPct from trades_sma into data_extended
+        # Use a left merge to keep all rows from data_extended (which is aligned with features)
+        # and fill missing PnL/ReturnPct with 0 for non-trade days or if trades_sma is shorter
+        data_extended = data_extended.merge(trades_sma[['PnL', 'ReturnPct']], 
+                                            left_index=True, right_index=True, how='left')
+        data_extended[['PnL', 'ReturnPct']] = data_extended[['PnL', 'ReturnPct']].fillna(value=0)
     trades_return_pct = data_extended['ReturnPct'].values
     y_base = [1 if x > threshold else 0 for x in trades_return_pct]
     # 4. Dataset generation
-    window_size = 30
-    X, y = [], []
-    for i in range(len(data) - window_size - 1):
-        X.append(data.iloc[i:i + window_size].values)
-        y.append(y_base[i])
+    print(f"DEBUG: Shape of feature_matrix before create_sequences: {feature_matrix.shape}")
+    print(f"DEBUG: Length of y_base before create_sequences: {len(y_base)}")
+    window_size = 30  # Define window_size
+    # Ensure feature_matrix.values and y_base are used with the create_sequences function
+    X_np, y_np = create_sequences(feature_matrix.values, np.array(y_base), window_size)
+    print(f"DEBUG: Shape of X_np after create_sequences: {X_np.shape}")
+    print(f"DEBUG: Shape of y_np after create_sequences: {y_np.shape}")
+
     # Now convert lists to tensors
-    X = torch.tensor(np.array(X), dtype=torch.float32)
-    y = torch.tensor(y, dtype=torch.long)
+    X = torch.tensor(X_np, dtype=torch.float32)
+    y = torch.tensor(y_np, dtype=torch.long)  # Use y_np here
     # DataLoader
     dataset = TensorDataset(X, y)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    # 5. Create models
+    # ... (rest of the code remains the same)
     models = {'CNN': {  'model': StockCNN(input_channels=num_features, window_size=window_size), 
                         'title': 'CNN model Predictions vs. Actual',
                         'model_trained': None},
@@ -273,8 +302,13 @@ def main(ticker='BTC/USDT', timeframe='1h'):
                             'title': 'CNN-LSTM model Prediction vs. Actual',
                             'model_trained': None}}
     
+    #models = {'CNN': {  'model': StockCNN(input_channels=num_features, window_size=window_size), 
+    #                    'title': 'CNN model Predictions vs. Actual',
+    #                    'model_trained': None}}
+    
     # 6. Train models
     for model in models:
+        print(f"Training {model} model...")
         model_trained = train_model(models[model]['title'], models[model]['model'], dataloader)
         models[model]['model_trained'] = model_trained
     # 7. Test models
@@ -284,8 +318,45 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     for model in models:
         torch.save(models[model]['model_trained'].state_dict(), f"{model}_model_trained.pt")
     # 9. Run models over real strategy
-    for model in models:
-        strategy = HW2Strategy_SMA(params=[model])
+    print("\n--- Running Backtests with Trained Models ---")
+    for model_key in models: # Renamed loop variable from 'model' for clarity
+        print(f"\nPreparing backtest for model: {model_key}...")
+        
+        # HW2Strategy_SMA (in assets/StrategyCollection.py) will need to be modified 
+        # to accept and use model, window_size, feature_names, and scaler parameters.
+        # For now, instantiating with original SMA parameters to allow the script to run.
+        # This backtest will use SMA logic, NOT the trained model.
+        print(f"INFO: HW2Strategy_SMA (defined in this file) needs update for model: {model_key}.")
+        print("INFO: Running backtest with default SMA logic for now.")
+        
+        # The 'data' DataFrame passed to Backtest is the one after 'features_generator.prepare_features(data)'
+        # It must contain 'Open', 'High', 'Low', 'Close', 'Volume' and all feature columns.
+        print(f"Running backtest for {model_key} using SMA logic (model not integrated yet).")
+        # Ensure 'data' is the DataFrame with features included
+        # Pass HW2Strategy_SMA class to Backtest constructor
+        bt = Backtest(data.copy(),  # Pass data.copy()
+                      HW2Strategy_SMA, 
+                      cash=10000, 
+                      commission=.002
+                     )
+        
+        try:
+            # Pass sma_short and sma_long to bt.run()
+            stats = bt.run(
+                sma_short=params_sma.get('sma_short', HW2Strategy_SMA.sma_short),
+                sma_long=params_sma.get('sma_long', HW2Strategy_SMA.sma_long)
+            )
+            print(f"--- Backtest Results for {model_key} driven strategy ---")
+            print(stats)
+            # Optionally, save plot:
+            # plot_filename = f"backtest_plot_{model_key}.html"
+            # bt.plot(filename=plot_filename, open_browser=False)
+            # print(f"Backtest plot for {model_key} saved to {plot_filename}")
+        except Exception as e:
+            print(f"ERROR during backtest for {model_key}: {e}")
+            print("This might be due to HW2Strategy_SMA not being fully adapted for model-based trading,")
+            print("or issues with data slicing/feature access within the strategy's next() method.")
+            traceback.print_exc() # Print detailed traceback
 
 def train_model(title, model, dataloader, num_epochs=10):
     criterion = nn.CrossEntropyLoss()
