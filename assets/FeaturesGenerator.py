@@ -218,7 +218,7 @@ class FeaturesGenerator:
             # Remove any remaining NaN values
             valid_idx = ~X.isna().any(axis=1)
             X = X[valid_idx]
-            return df.loc[X.index].copy(), X.copy(), feature_columns
+            return X.copy(), feature_columns
             
         except Exception as e:
             logging.error(f"Error in prepare_features: {str(e)}")

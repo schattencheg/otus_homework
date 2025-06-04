@@ -51,6 +51,8 @@ class HW2Backtest:
                     continue
             
             try:
+                if 'model' not in params:
+                    params['model'] = None
                 # Run backtest with current parameters
                 stats = self.backtest_strategy(self.train_data, strategy_class, params)
                 stats['Trades'] = len(stats['_trades'])

@@ -1,36 +1,34 @@
 #%pip install backtesting
 #%pip install nbformat
-from matplotlib import pyplot as plt
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score
+import os
 import traceback
+from matplotlib import pyplot as plt
+import numpy as np
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from assets.DataProvider import DataProvider
+from assets.FeaturesGenerator import FeaturesGenerator
+import torch
+import numpy as np
 from assets.HW2Backtest import HW2Backtest
 from assets.enums import DataPeriod, DataResolution
-from backtesting import Strategy, Backtest
-from assets.FeaturesGenerator import FeaturesGenerator
-
-import numpy as np # Make sure numpy is imported
-
-def create_sequences(data_values, target_values, window_size):
-    X, y = [], []
-    for i in range(len(data_values) - window_size):
-        X.append(data_values[i:(i + window_size)])
-        y.append(target_values[i + window_size])
-    return np.array(X), np.array(y)
-
+from backtesting import Backtest, Strategy
 
 
 class HW2Strategy_SMA(Strategy):
     # Define parameters
     sma_short = 10
     sma_long = 20
+    model = None
+    predicted = None
+    window_size = 30       # Default, overridden if passed in bt.run()
+    features_generator = FeaturesGenerator()
     
     # Risk management parameters
     atr_period = 14  # ATR period for volatility calculation
@@ -38,7 +36,56 @@ class HW2Strategy_SMA(Strategy):
     trailing_stop_atr = 2.0  # Trailing stop distance in ATR units
     initial_stop_atr = 3.0  # Initial stop loss distance in ATR units
     
-    def init(self, model = None):
+    def _get_feature_window(self):
+        feature_calc_buffer = 60 
+        required_ohlc_length = self.window_size + feature_calc_buffer
+
+        if len(self.data.df) < required_ohlc_length:
+            return None
+
+        ohlc_for_features = self.data.df.iloc[-required_ohlc_length:].copy()
+        ohlc_for_features = self.data.df.copy()
+        all_features_df, _ = self.features_generator.prepare_features(ohlc_for_features)
+
+        if len(all_features_df) < self.window_size:
+            return None
+        
+        feature_window_np = all_features_df.iloc[-self.window_size:].values
+        
+        if feature_window_np.shape[0] != self.window_size:
+            return None
+            
+        return feature_window_np
+
+    def predict_signal(self) -> int:
+        if not self.model:
+            return -1 # No model, so hold/no signal
+
+        feature_window = self._get_feature_window()
+        if feature_window is None:
+            return -1 # Cannot get features, hold
+
+        if not isinstance(feature_window, np.ndarray):
+            return -1 # Invalid features, hold
+
+        try:
+            features_tensor = torch.tensor(feature_window, dtype=torch.float32).unsqueeze(0)
+        except Exception as e:
+            # print(f"DEBUG STRATEGY: Error converting feature_window to tensor: {e}")
+            return -1 # Error, hold
+
+        self.model.eval()
+        with torch.no_grad():
+            try:
+                raw_prediction = self.model(features_tensor)
+            except Exception as e:
+                # print(f"DEBUG STRATEGY: Error during model prediction: {e}")
+                return -1 # Error, hold
+        
+        predicted_class = torch.argmax(raw_prediction, dim=1).item()
+        return int(predicted_class) # 0 or 1
+
+    def init(self):
         # Calculate indicators for visualization
         close_series = pd.Series(self.data.Close)
         self.sma_short_line = self.I(lambda x: x.rolling(window=self.sma_short).mean(), close_series)
@@ -60,6 +107,10 @@ class HW2Strategy_SMA(Strategy):
         self.initial_stop = None
     
     def next(self):
+        if self.model is not None:
+            features, feature_columns = self.features_generator.prepare_features(self.data.df.copy())
+            if len(features) > 0:
+                self.predicted = self.predict_signal()
         # Check if we have enough data
         if pd.isna(self.sma_long_line[-1]) or pd.isna(self.atr[-1]):
             return
@@ -92,6 +143,8 @@ class HW2Strategy_SMA(Strategy):
                          self.sma_short_line[-2] >= self.sma_long_line[-2])
         strong_downtrend = trend_strength < -0.015
         
+        if self.predicted == 1:
+            print('Predicted to enter!')
         # Execute signals
         if not self.position:
             if (sma_cross_up and strong_uptrend) or (not strong_downtrend):
@@ -106,7 +159,6 @@ class HW2Strategy_SMA(Strategy):
                 
                 # Enter position
                 self.buy(size=position_size)
-        
         else:
             if self.position.is_long:
                 # Exit conditions
@@ -114,6 +166,13 @@ class HW2Strategy_SMA(Strategy):
                     self.position.close()
                     self.trailing_stop = None
 
+
+    def predict(self) -> float:
+        data_values = self.data.df.values
+        X_np = []
+        for i in range(len(data_values) - self.window_size):
+            X_np.append(data_values[i:(i + self.window_size)])
+        return self.model(np.array(X_np))
 
 class Strategy_HW2:
     def __init__(self, ticker: str = 'BTC/USDT', timeframe: str = '1h', 
@@ -244,7 +303,7 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     # 2. Add features
     features_generator = FeaturesGenerator()
     data_initial_ohlc = data.copy()  # Store a true copy of original OHLC data
-    data, feature_matrix, feature_names = features_generator.prepare_features(data_initial_ohlc) # Pass original; 'data' is now data_ohlc_aligned_with_features
+    feature_matrix, feature_names = features_generator.prepare_features(data_initial_ohlc) # Pass original; 'data' is now data_ohlc_aligned_with_features
     num_features = feature_matrix.shape[1]
     print(f"Number of features generated: {num_features} ({len(feature_names)} names)")
     # 3. Generate target
@@ -254,10 +313,8 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     trades_sma = strategy_hw2.trades_sma
     params_sma = strategy_hw2.params_sma
     # 3.2. Extract data for ML
-    # Add PnL and Returns from strategy run
-    # 'data' here is data_ohlc_aligned_with_features (from prepare_features output), which is correctly aligned for y_base
-    data_extended = data.copy() 
-
+    # Add PnL and Returns from strategy run as additional features
+    data_extended = feature_matrix.copy() 
     if trades_sma is None or trades_sma.empty:
         print("WARN: No trades from SMA strategy. PnL and ReturnPct will be zero for y_base generation.")
         data_extended['PnL'] = 0.0
@@ -280,14 +337,12 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     X_np, y_np = create_sequences(feature_matrix.values, np.array(y_base), window_size)
     print(f"DEBUG: Shape of X_np after create_sequences: {X_np.shape}")
     print(f"DEBUG: Shape of y_np after create_sequences: {y_np.shape}")
-
     # Now convert lists to tensors
     X = torch.tensor(X_np, dtype=torch.float32)
     y = torch.tensor(y_np, dtype=torch.long)  # Use y_np here
     # DataLoader
     dataset = TensorDataset(X, y)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
     # ... (rest of the code remains the same)
     models = {'CNN': {  'model': StockCNN(input_channels=num_features, window_size=window_size), 
                         'title': 'CNN model Predictions vs. Actual',
@@ -302,9 +357,9 @@ def main(ticker='BTC/USDT', timeframe='1h'):
                             'title': 'CNN-LSTM model Prediction vs. Actual',
                             'model_trained': None}}
     
-    #models = {'CNN': {  'model': StockCNN(input_channels=num_features, window_size=window_size), 
-    #                    'title': 'CNN model Predictions vs. Actual',
-    #                    'model_trained': None}}
+    models = {'CNN': {  'model': StockCNN(input_channels=num_features, window_size=window_size), 
+                        'title': 'CNN model Predictions vs. Actual',
+                        'model_trained': None}}
     
     # 6. Train models
     for model in models:
@@ -316,19 +371,20 @@ def main(ticker='BTC/USDT', timeframe='1h'):
         test_model(models[model]['title'], models[model]['model_trained'], dataloader)
     # 8. Save models
     for model in models:
-        torch.save(models[model]['model_trained'].state_dict(), f"{model}_model_trained.pt")
+        if not os.path.exists(f"hw5"):
+            os.makedirs(f"hw5")
+        torch.save(models[model]['model_trained'].state_dict(), f"hw5/{model}_model_trained.pt")
     # 9. Run models over real strategy
     print("\n--- Running Backtests with Trained Models ---")
+    all_backtest_results = {} # Initialize dictionary to store results
     for model_key in models: # Renamed loop variable from 'model' for clarity
-        print(f"\nPreparing backtest for model: {model_key}...")
-        
+        print(f"\n\n\nPreparing backtest for model: {model_key}...")
         # HW2Strategy_SMA (in assets/StrategyCollection.py) will need to be modified 
         # to accept and use model, window_size, feature_names, and scaler parameters.
         # For now, instantiating with original SMA parameters to allow the script to run.
         # This backtest will use SMA logic, NOT the trained model.
         print(f"INFO: HW2Strategy_SMA (defined in this file) needs update for model: {model_key}.")
         print("INFO: Running backtest with default SMA logic for now.")
-        
         # The 'data' DataFrame passed to Backtest is the one after 'features_generator.prepare_features(data)'
         # It must contain 'Open', 'High', 'Low', 'Close', 'Volume' and all feature columns.
         print(f"Running backtest for {model_key} using SMA logic (model not integrated yet).")
@@ -336,27 +392,39 @@ def main(ticker='BTC/USDT', timeframe='1h'):
         # Pass HW2Strategy_SMA class to Backtest constructor
         bt = Backtest(data.copy(),  # Pass data.copy()
                       HW2Strategy_SMA, 
-                      cash=10000, 
-                      commission=.002
-                     )
-        
+                      cash=10000000, 
+                      commission=.002)
         try:
             # Pass sma_short and sma_long to bt.run()
             stats = bt.run(
                 sma_short=params_sma.get('sma_short', HW2Strategy_SMA.sma_short),
-                sma_long=params_sma.get('sma_long', HW2Strategy_SMA.sma_long)
+                sma_long=params_sma.get('sma_long', HW2Strategy_SMA.sma_long),
+                model=models[model_key]['model_trained']
             )
             print(f"--- Backtest Results for {model_key} driven strategy ---")
             print(stats)
-            # Optionally, save plot:
-            # plot_filename = f"backtest_plot_{model_key}.html"
-            # bt.plot(filename=plot_filename, open_browser=False)
-            # print(f"Backtest plot for {model_key} saved to {plot_filename}")
+            all_backtest_results[model_key] = {'stats': stats}
+            plot_filename = f"backtest_plot_{model_key}.html"
+            try:
+                bt.plot(filename=plot_filename, open_browser=False)
+                all_backtest_results[model_key]['plot_file'] = plot_filename
+                print(f"Backtest plot for {model_key} saved to {plot_filename}")
+            except Exception as e:
+                print(f"ERROR: Could not generate plot for {model_key}: {e}")
+                all_backtest_results[model_key]['plot_file'] = None
         except Exception as e:
             print(f"ERROR during backtest for {model_key}: {e}")
             print("This might be due to HW2Strategy_SMA not being fully adapted for model-based trading,")
             print("or issues with data slicing/feature access within the strategy's next() method.")
             traceback.print_exc() # Print detailed traceback
+    print("\n\n--- Summary of All Backtest Results ---")
+    for model_key_summary, results_summary in all_backtest_results.items(): # Renamed loop variables for clarity
+        print(f"\n--- Results for {model_key_summary} ---")
+        print(results_summary['stats'])
+        if 'plot_file' in results_summary and results_summary['plot_file']:
+            print(f"Plot saved to: {results_summary['plot_file']}")
+        else:
+            print("Plot generation failed or was not attempted.")
 
 def train_model(title, model, dataloader, num_epochs=10):
     criterion = nn.CrossEntropyLoss()
@@ -406,7 +474,7 @@ def test_model(title, model, dataloader):
     # Calculate accuracy
     accuracy = accuracy_score(all_targets, all_predictions)
     print(f"{title} Accuracy: {accuracy:.4f}")
-    
+    return accuracy
     # Plot actual vs predicted labels
     plt.figure(figsize=(12, 6))
     plt.plot(all_targets[-30:], label='Actual', color='blue', linestyle='--', alpha=0.7)
@@ -418,6 +486,14 @@ def test_model(title, model, dataloader):
     plt.show()
     
     return accuracy
+
+def create_sequences(data_values, target_values, window_size):
+    X, y = [], []
+    for i in range(len(data_values) - window_size):
+        X.append(data_values[i:(i + window_size)])
+        y.append(target_values[i + window_size])
+    return np.array(X), np.array(y)
+
 
 if __name__ == "__main__":
     ticker = 'BTC/USDT'
