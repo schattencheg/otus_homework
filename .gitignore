@@ -179,3 +179,7 @@ dashboard/
 results/
 
 *.pt
+
+temp/
+
+backtest_plots/

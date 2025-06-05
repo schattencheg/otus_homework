@@ -15,7 +15,7 @@ class StockCNN(nn.Module):
         self.conv1 = nn.Conv1d(input_channels, 16, kernel_size=kernel_size_conv1)  # Input: dynamic channels, Output: 16 channels
         self.conv2 = nn.Conv1d(16, 32, kernel_size=kernel_size_conv2)  # Input: 16 channels, Output: 32 channels
         self.fc1 = nn.Linear(32 * (window_size - (kernel_size_conv1 - 1) -(kernel_size_conv2 - 1)), 64)  # Flattened size after conv
-        self.fc2 = nn.Linear(64, 3)  # Output: 3 classes (Buy, Hold, Sell)
+        self.fc2 = nn.Linear(64, 2)  # Output: 2 classes (Buy, Hold)
 
     def forward(self, x):
         # Input x shape: (batch_size, window_size, num_features)
@@ -31,7 +31,7 @@ class StockLSTM(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=2):
         super(StockLSTM, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, 3)
+        self.fc = nn.Linear(hidden_size, 2)
 
     def forward(self, x):
         _, (h_n, _) = self.lstm(x)
@@ -43,7 +43,7 @@ class StockGRU(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=2):
         super(StockGRU, self).__init__()
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, 3)
+        self.fc = nn.Linear(hidden_size, 2)
 
     def forward(self, x):
         _, h_n = self.gru(x)
@@ -59,7 +59,7 @@ class StockCNN_LSTM(nn.Module):
 
         self.lstm = nn.LSTM(input_size=32, hidden_size=64, num_layers=1, batch_first=True)
 
-        self.fc1 = nn.Linear(64, 3)  # Output: 3 classes (Buy, Hold, Sell)
+        self.fc1 = nn.Linear(64, 2)  # Output: 2 classes (Buy, Hold)
 
     def forward(self, x):
         # Input x shape: (batch_size, window_size, num_features)

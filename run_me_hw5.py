@@ -44,8 +44,8 @@ def main(ticker='BTC/USDT', timeframe='1h'):
     # 3.1. Generate trades, using homework 2 (only long)
     strategy_hw2 = SMABaselineGenerator(ticker, timeframe, data_provider)
     strategy_hw2.evaluate_strategies()
-    trades_sma = strategy_hw2.trades_sma
-    params_sma = strategy_hw2.params_sma
+    trades_sma = strategy_hw2.best_trades
+    params_sma = strategy_hw2.best_params
     # 3.2. Extract data for ML
     # Add PnL and Returns from strategy run as additional features
     data_extended = feature_matrix.copy() 
