@@ -24,7 +24,7 @@ class HW2Backtest:
         stats = bt.run(**params)
         return stats
 
-    def get_best_strategy(self, strategy_class, param_grid, count: int = 5) -> Dict[str, Any]:
+    def get_best_strategy(self, strategy_class, param_grid, count: int = 5) -> Tuple[Dict,Any]:
         # Generate all combinations of parameters
         param_combinations = [dict(zip(param_grid.keys(), v)) 
                             for v in itertools.product(*param_grid.values())]
@@ -88,9 +88,10 @@ class HW2Backtest:
         print("\nBest parameters found:")
         for params, score in zip(best_params, best_scores):
             print(f"{score:.2f}: {params}")
+        best_param = best_params[0]
         best_score = best_scores[0]
         best_result = best_results[0]
-
+        
         print(f"\nBest score: {best_score:.2f}")
         print("\nBest strategy performance:")
         print(f"Return: {best_result['Return [%]']:.2f}%")
@@ -99,7 +100,7 @@ class HW2Backtest:
         print(f"Max Drawdown: {best_result['Max. Drawdown [%]']:.2f}%")
         print(f"Win Rate: {best_result['Win Rate [%]']:.2f}%")
             
-        return best_params
+        return best_param, best_result
 
     def create_performance_dashboard(self, strategies_results: Dict[str, Dict[str, float]]) -> None:
         """Create a dashboard comparing different strategies performance"""
