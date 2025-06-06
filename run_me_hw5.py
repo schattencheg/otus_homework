@@ -91,10 +91,6 @@ def main(ticker='BTC/USDT', timeframe='1h'):
                             'title': 'CNN-LSTM model Prediction vs. Actual',
                             'model_trained': None}}
     
-    models = {'CNN': {  'model': StockCNN(input_channels=num_features, window_size=window_size), 
-                        'title': 'CNN model Predictions vs. Actual',
-                        'model_trained': None}}
-    
     # 6. Train models
     for model in models:
         print(f"Training {model} model...")
@@ -151,6 +147,7 @@ def main(ticker='BTC/USDT', timeframe='1h'):
             print("This might be due to HW2Strategy_SMA not being fully adapted for model-based trading,")
             print("or issues with data slicing/feature access within the strategy's next() method.")
             traceback.print_exc() # Print detailed traceback
+    stats_total = [x['stats'] for x in all_backtest_results.values()]
     print("\n\n--- Summary of All Backtest Results ---")
     for model_key_summary, results_summary in all_backtest_results.items(): # Renamed loop variables for clarity
         print(f"\n--- Results for {model_key_summary} ---")
@@ -159,6 +156,9 @@ def main(ticker='BTC/USDT', timeframe='1h'):
             print(f"Plot saved to: {results_summary['plot_file']}")
         else:
             print("Plot generation failed or was not attempted.")
+    # Stats comparison
+    
+
 
 def train_model(title, model, dataloader, num_epochs=10):
     criterion = nn.CrossEntropyLoss()
