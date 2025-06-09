@@ -612,7 +612,7 @@ def train_models(X_train, y_train, window_size, num_features):
         total_loss = 0
         for batch_X, batch_y in train_loader:
             optimizer.zero_grad()
-            outputs = cnn_model(batch_X)
+            outputs = cnn_model(batch_X.transpose(1, 2))
             loss = criterion(outputs, batch_y)
             loss.backward()
             optimizer.step()
