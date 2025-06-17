@@ -1,22 +1,30 @@
+from datetime import datetime
+from enum import Enum
+import os
+import platform
+from tqdm import tqdm
+
+# Clear terminal at start
+os.system('cls' if platform.system() == 'Windows' else 'clear')
+
 import numpy as np
 import pandas as pd
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from datetime import datetime
-from enum import Enum
+
 from assets.DataProvider import DataProvider
 from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataResolution
+from assets.hw6.SimpleBacktester import SimpleBacktester
 
 
 # Neural Network Models
 class SimpleLSTM(nn.Module):
     def __init__(self, input_size, hidden_size=128):
-        super().__init__()
+        super(SimpleLSTM, self).__init__()
         self.lstm1 = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.bn1 = nn.BatchNorm1d(hidden_size)
         self.dropout1 = nn.Dropout(0.3)
@@ -40,36 +48,58 @@ class SimpleLSTM(nn.Module):
 
 class SimpleCNN(nn.Module):
     def __init__(self, input_channels, window_size):
-        super().__init__()
+        super(SimpleCNN, self).__init__()
+        print(f"CNN init - input_channels: {input_channels}, window_size: {window_size}")
+        
+        # First convolution layer
         self.conv1 = nn.Conv1d(input_channels, 32, kernel_size=3)
         self.bn1 = nn.BatchNorm1d(32)
+        # Second convolution layer
         self.conv2 = nn.Conv1d(32, 64, kernel_size=3)
         self.bn2 = nn.BatchNorm1d(64)
         self.pool = nn.MaxPool1d(2)
         self.dropout = nn.Dropout(0.3)
         
-        # Calculate final size after convolutions and pooling
-        conv_size = window_size - 4  # After two conv layers with kernel_size=3
-        pooled_size = conv_size // 2  # After MaxPool1d(2)
+        # Calculate size after convolutions and pooling
+        # First conv reduces size by 2 (kernel_size=3)
+        conv1_size = window_size - 2
+        # Second conv reduces size by 2
+        conv2_size = conv1_size - 2
+        # MaxPool reduces size by half
+        pooled_size = conv2_size // 2
+        # Final flattened size
         self.final_size = pooled_size * 64
-        
-        self.fc1 = nn.Linear(self.final_size, 32)
-        self.fc2 = nn.Linear(32, 2)
+       
+        # Fully connected layers
+        self.fc1 = nn.Linear(self.final_size, 64)
+        self.fc2 = nn.Linear(64, 2)
     
     def forward(self, x):
-        # Input shape: (batch, channels, sequence)
+        # First conv block
         x = self.conv1(x)
         x = self.bn1(x)
         x = torch.relu(x)
         
+        # Second conv block
         x = self.conv2(x)
         x = self.bn2(x)
         x = torch.relu(x)
         
+        # Pooling and dropout
         x = self.pool(x)
         x = self.dropout(x)
         
-        x = x.reshape(x.size(0), -1)  # Flatten
+        # Flatten and reshape
+        x = x.reshape(x.size(0), -1)
+        
+        # Update final_size if needed
+        if self.final_size != x.size(1):
+            print(f"Warning: Expected size {self.final_size} but got {x.size(1)}")
+            self.final_size = x.size(1)
+            # Recreate the linear layer with correct size
+            self.fc1 = nn.Linear(self.final_size, 64)
+        
+        # Fully connected layers
         x = torch.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
@@ -78,7 +108,7 @@ class SimpleCNN(nn.Module):
 
 class SimpleVotingModel(nn.Module):
     def __init__(self, input_size):
-        super().__init__()
+        super(SimpleVotingModel, self).__init__()
         self.fc1 = nn.Linear(input_size, 128)
         self.bn1 = nn.BatchNorm1d(128)
         self.fc2 = nn.Linear(128, 64)
@@ -95,391 +125,11 @@ class SimpleVotingModel(nn.Module):
         return self.fc3(x)
 
 
-class SimpleBacktester:
-    def __init__(self, data, features, lstm_model, cnn_model, voting_model):
-        self.data = data
-        self.features = features
-        self.lstm_model = lstm_model
-        self.cnn_model = cnn_model
-        self.voting_model = voting_model
-        
-        # Initialize portfolio
-        self.cash = 100000  # Starting with $100k
-        self.positions = []  # List to track open positions
-        self.trades = []  # List to track completed trades
-        
-        # Risk parameters
-        self.max_positions = 5  # Max number of concurrent positions
-        self.max_position_size = 2.0  # Maximum position size in BTC
-        self.base_stop_loss_pct = 0.02  # Base stop loss at 2%
-        self.trailing_stop_pct = 0.01  # 1% trailing stop
-        self.risk_per_trade = 0.03  # Risk 3% per trade
-        self.commission = 0.001  # 0.1% commission per trade
-        
-        # Performance tracking
-        self.peak_value = 100000
-        self.max_drawdown = 0
-        self.total_trades = 0
-        self.winning_trades = 0
-        
-        # Technical parameters
-        self.window_size = 60  # Lookback window for features
-        
-        # Initialize performance metrics
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.max_drawdown = 0
-        
-        # Calculate ATR for dynamic stop losses
-        self.atr = self.calculate_atr(14)
-        
-        # Initialize performance metrics
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.max_drawdown = 0
-        self.peak_value = self.cash
-    
-    def calculate_atr(self, period):
-        high = self.data['High']
-        low = self.data['Low']
-        close = self.data['Close']
-        
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        return tr.rolling(window=period).mean()
-    
-    def get_dynamic_stops(self, current_price, current_time):
-        # Get current ATR value
-        current_atr = self.atr.loc[current_time]
-        atr_multiplier = 2.0
-        
-        # Calculate dynamic stop loss (2-3 ATR)
-        stop_loss_pct = min(self.base_stop_loss_pct * 1.5,
-                           (current_atr * atr_multiplier) / current_price)
-        
-        # Calculate dynamic take profit (1.5-2x stop loss)
-        take_profit_pct = stop_loss_pct * 2
-        
-        return stop_loss_pct, take_profit_pct
-    
-    def calculate_volatility(self, window=20):
-        returns = self.data['Close'].pct_change()
-        return returns.rolling(window=window).std()
-        
-    def calculate_position_size(self, signal_strength, current_price, current_vol):
-        # Base position size as percentage of portfolio
-        risk_per_trade = 0.03  # 3% risk per trade
-        account_value = self.cash + sum(pos['size'] * current_price for pos in self.positions)
-        base_size = risk_per_trade * signal_strength
-        
-        # Adjust for volatility (less impact)
-        vol_percentile = current_vol / self.data['Close'].pct_change().std()
-        vol_factor = 1 / (1 + vol_percentile * 0.5)  # Less reduction for volatility
-        
-        # Calculate target position value
-        target_value = base_size * account_value * vol_factor
-        size = target_value / current_price
-        
-        # Ensure minimum trade size of $1000
-        min_size = 1000 / current_price
-        size = max(size, min_size)
-        
-        # Cap at max position size
-        size = min(size, self.max_position_size)
-        
-        # Round to 3 decimal places
-        return round(size, 3)
-        
-    def run(self):
-        volatility = self.calculate_volatility()
-        self.trades = []  # Initialize trades list
-        print("Starting backtest with cash:", self.cash)
-        
-        for i in range(self.window_size, len(self.data)):
-            current_data = self.data.iloc[:i+1]
-            current_price = current_data.iloc[-1]['Close']
-            current_time = current_data.index[-1]
-            current_vol = volatility.iloc[i] if i < len(volatility) else volatility.iloc[-1]
-            
-            # Update portfolio metrics
-            portfolio_value = self.cash + sum(pos['size'] * current_price for pos in self.positions)
-            print(f"\nTime: {current_time}, Price: {current_price:.2f}, Portfolio: {portfolio_value:.2f}")
-            
-            if portfolio_value > self.peak_value:
-                self.peak_value = portfolio_value
-            else:
-                drawdown = (self.peak_value - portfolio_value) / self.peak_value
-                self.max_drawdown = max(self.max_drawdown, drawdown)
-            
-            # Get signal strength (0 to 1)
-            signal_strength = self._get_signal(current_data)
-            
-            # Open new position if we have a signal
-            if signal_strength is not None and signal_strength > 0:
-                # Calculate position size based on risk and signal strength
-                risk_amount = self.cash * self.risk_per_trade
-                target_value = risk_amount * signal_strength * 10  # Scale up the position size
-                
-                # Adjust for volatility (reduce position size when volatility is high)
-                volatility_factor = 1 / (1 + volatility)
-                target_value = target_value * volatility_factor
-                
-                # Enforce minimum trade size
-                target_value = max(target_value, 1000)  # Minimum $1000 position
-                
-                # Cap by maximum position size
-                target_value = min(target_value, self.max_position_size)
-                
-                # Calculate number of units to buy
-                position_size = round(target_value / current_price, 3)  # Round to 3 decimals
-                
-                # Check if we can afford it
-                cost = position_size * current_price
-                if cost <= self.cash:
-                    # Calculate stop loss and take profit levels
-                    stop_loss = current_price * (1 - self.stop_loss_pct)
-                    take_profit = current_price * (1 + self.take_profit_pct)
-                    
-                    # Open the position
-                    self.positions.append({
-                        'entry_time': current_time,
-                        'entry_price': current_price,
-                        'size': position_size,
-                        'stop_loss': stop_loss,
-                        'take_profit': take_profit,
-                        'high_water_mark': current_price
-                    })
-                    
-                    # Deduct the cost plus commission
-                    self.cash -= cost * (1 + self.commission)
-                    print(f"Opened position: {position_size:.3f} units at {current_price:.2f}")
-                    print(f"Cost: ${cost:.2f}, Remaining cash: ${self.cash:.2f}")
-                    print(f"Stop loss: ${stop_loss:.2f}, Take profit: ${take_profit:.2f}")
-                else:
-                    print(f"Not enough cash (${self.cash:.2f}) for position costing ${cost:.2f}")
-        
-        # Close any remaining positions at the end
-        if self.positions:
-            final_price = self.data.iloc[-1]['Close']
-            final_time = self.data.index[-1]
-            
-            for pos in self.positions:
-                pnl = (final_price - pos['entry_price']) * pos['size']
-                self.trades.append({
-                    'entry_time': pos['entry_time'],
-                    'exit_time': final_time,
-                    'entry_price': pos['entry_price'],
-                    'exit_price': final_price,
-                    'size': pos['size'],
-                    'pnl': pnl,
-                    'return': pnl / (pos['entry_price'] * pos['size'])
-                })
-                self.cash += final_price * pos['size'] * (1 - self.commission)
-            
-            self.positions = []
-        
-        return pd.DataFrame(self.trades)
-    
-    def check_stops(self, data):
-        current_price = data.iloc[-1]['Close']
-        current_time = data.index[-1]
-        closed_positions = []
-        positions_to_remove = []
-        
-        # Check each position for stop loss, take profit, or trailing stop
-        for pos in self.positions:
-            # Update high water mark
-            if current_price > pos['high_water_mark']:
-                pos['high_water_mark'] = current_price
-                # Update trailing stop
-                pos['stop_loss'] = max(pos['stop_loss'],
-                                     current_price * (1 - self.trailing_stop_pct))
-            
-            # Check if we hit stop loss or take profit
-            if current_price <= pos['stop_loss'] or current_price >= pos['take_profit']:
-                # Calculate PnL
-                pnl = (current_price - pos['entry_price']) * pos['size']
-                
-                # Record the trade
-                closed_positions.append({
-                    'entry_time': pos['entry_time'],
-                    'exit_time': current_time,
-                    'entry_price': pos['entry_price'],
-                    'exit_price': current_price,
-                    'size': pos['size'],
-                    'pnl': pnl,
-                    'return': pnl / (pos['entry_price'] * pos['size'])
-                })
-                
-                # Update cash
-                self.cash += current_price * pos['size'] * (1 - self.commission)
-                
-                # Mark position for removal
-                positions_to_remove.append(pos)
-        
-        # Remove closed positions
-        for pos in positions_to_remove:
-            self.positions.remove(pos)
-        
-        return closed_positions
-    
-    def _get_signal(self, data):
-        # Set models to evaluation mode
-        self.lstm_model.eval()
-        self.cnn_model.eval()
-        self.voting_model.eval()
-        
-        # Get recent price data for trend confirmation
-        recent_close = data['Close'].iloc[-5:]  # Shorter lookback
-        price_trend = recent_close.iloc[-1] > recent_close.mean()
-        print(f"\nPrice trend: {price_trend}")
-        
-        # Calculate momentum indicators
-        returns = data['Close'].pct_change()
-        
-        # Calculate RSI
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs.iloc[-1]))
-        
-        # Calculate MACD
-    def check_stops(self, data):
-        current_price = data.iloc[-1]['Close']
-        current_time = data.index[-1]
-        closed_positions = []
-        positions_to_remove = []
-        
-        # Check each position for stop loss, take profit, or trailing stop
-        for pos in self.positions:
-            # Update high water mark
-            if current_price > pos['high_water_mark']:
-                pos['high_water_mark'] = current_price
-                # Update trailing stop
-                pos['stop_loss'] = max(pos['stop_loss'],
-                                     current_price * (1 - self.trailing_stop_pct))
-            
-            # Check if we hit stop loss or take profit
-            if current_price <= pos['stop_loss'] or current_price >= pos['take_profit']:
-                # Calculate PnL
-                pnl = (current_price - pos['entry_price']) * pos['size']
-                
-                # Record the trade
-                closed_positions.append({
-                    'entry_time': pos['entry_time'],
-                    'exit_time': current_time,
-                    'entry_price': pos['entry_price'],
-                    'exit_price': current_price,
-                    'size': pos['size'],
-                    'pnl': pnl,
-                    'return': pnl / (pos['entry_price'] * pos['size'])
-                })
-                
-                # Update cash
-                self.cash += current_price * pos['size'] * (1 - self.commission)
-                
-                # Mark position for removal
-                positions_to_remove.append(pos)
-        
-        # Remove closed positions
-        for pos in positions_to_remove:
-            self.positions.remove(pos)
-        
-        return closed_positions
-    
-    def _get_signal(self, data):
-        # Set models to evaluation mode
-        self.lstm_model.eval()
-        self.cnn_model.eval()
-        self.voting_model.eval()
-        
-        # Get recent price data for trend confirmation
-        recent_close = data['Close'].iloc[-5:]  # Shorter lookback
-        price_trend = recent_close.iloc[-1] > recent_close.mean()
-        print(f"\nPrice trend: {price_trend}")
-        
-        # Calculate momentum indicators
-        returns = data['Close'].pct_change()
-        
-        # Calculate RSI
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs.iloc[-1]))
-        
-        # Calculate MACD
-        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-        macd = exp1.iloc[-1] - exp2.iloc[-1]
-        signal = (exp1 - exp2).ewm(span=9, adjust=False).mean()
-        macd_signal = signal.iloc[-1]
-        
-        # More lenient momentum conditions
-        momentum_bullish = (
-            rsi > 40 or  # RSI above 40 (even more lenient)
-            macd > macd_signal or  # MACD crossover
-            returns.iloc[-1] > 0  # Recent positive return
-        )
-        print(f"RSI: {rsi:.2f}, MACD: {macd:.2f}, MACD Signal: {macd_signal:.2f}")
-        print(f"Momentum bullish: {momentum_bullish}")
-        
-        # Get recent features for prediction
-        features = self.features.loc[data.index[-self.window_size:]].values
-        features_tensor = torch.FloatTensor(features).unsqueeze(0)
-        last_features = torch.FloatTensor(features[-1]).unsqueeze(0)
-        
-        with torch.no_grad():
-            # LSTM prediction
-            lstm_input = features_tensor.repeat(2, 1, 1)
-            lstm_pred = torch.softmax(self.lstm_model(lstm_input), dim=1)[0]
-            
-            # CNN prediction (reshape input for CNN)
-            cnn_input = features_tensor.transpose(1, 2)  # (batch, seq_len, features) -> (batch, features, seq_len)
-            cnn_pred = torch.softmax(self.cnn_model(cnn_input), dim=1)[0]
-            
-            # Voting model prediction
-            vote_input = last_features.repeat(2, 1)
-            voting_pred = torch.softmax(self.voting_model(vote_input), dim=1)[0]
-        
-        # Weight models based on their validation accuracy
-        lstm_weight = 0.25
-        cnn_weight = 0.30
-        vote_weight = 0.45
-        
-        # Calculate weighted ensemble prediction
-        ensemble_pred = (
-            lstm_pred.numpy() * lstm_weight +
-            cnn_pred.numpy() * cnn_weight +
-            voting_pred.numpy() * vote_weight
-        )
-        confidence = ensemble_pred[1]  # Probability of positive class
-        print(f"Model confidence: {confidence:.2f}")
-        
-        # Even more lenient signal generation
-        if price_trend or momentum_bullish:  # Only need one confirmation
-            if confidence > 0.40:  # Lower threshold
-                print("Taking full position")
-                return 1.0
-            elif confidence > 0.35:
-                print("Taking 75% position")
-                return 0.75
-            elif confidence > 0.30:
-                print("Taking 50% position")
-                return 0.5
-        
-        print("No position taken")
-        return 0
-
-
 def prepare_data(ticker='BTC/USDT', resolution=DataResolution.DAY_01):
     # Load data
     data_provider = DataProvider(tickers=[ticker], skip_dashboard=True, resolution=resolution)
     data_provider.data_load()
+    data_provider.data_refresh()
     if ticker not in data_provider.data:
         data_provider.data_request()
         data_provider.clean_data()
@@ -558,24 +208,24 @@ def create_sequences(features, targets, window_size):
     
     return X, y
 
-def train_models(X_train, y_train, window_size, num_features):
+def train_models(X_train, y_train, window_size, num_features, device):
     # Prepare sequence data for neural networks
     X_seq, y_seq = create_sequences(X_train.values, y_train.values, window_size)
-    X_tensor = torch.FloatTensor(X_seq)
-    y_tensor = torch.LongTensor(y_seq)
+    X_tensor = torch.FloatTensor(X_seq).to(device)
+    y_tensor = torch.LongTensor(y_seq).to(device)
     train_dataset = TensorDataset(X_tensor, y_tensor)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
     # Prepare data for voting model
-    X_vote_tensor = torch.FloatTensor(X_train.values)
-    y_vote_tensor = torch.LongTensor(y_train.values)
+    X_vote_tensor = torch.FloatTensor(X_train.values).to(device)
+    y_vote_tensor = torch.LongTensor(y_train.values).to(device)
     vote_dataset = TensorDataset(X_vote_tensor, y_vote_tensor)
     vote_loader = DataLoader(vote_dataset, batch_size=32, shuffle=True)
 
-    # Initialize models
-    lstm_model = SimpleLSTM(num_features)
-    cnn_model = SimpleCNN(num_features, window_size)
-    voting_model = SimpleVotingModel(num_features)
+    # Initialize models and move to device
+    lstm_model = SimpleLSTM(num_features).to(device)
+    cnn_model = SimpleCNN(num_features, window_size).to(device)
+    voting_model = SimpleVotingModel(num_features).to(device)
 
     # Train LSTM
     criterion = nn.CrossEntropyLoss()
@@ -584,7 +234,8 @@ def train_models(X_train, y_train, window_size, num_features):
     patience = 5
     no_improve = 0
     
-    for epoch in range(20):  # Increased epochs
+    print("Training LSTM...")
+    for epoch in tqdm(range(20), desc="LSTM epochs"):  # Increased epochs
         total_loss = 0
         for batch_X, batch_y in train_loader:
             optimizer.zero_grad()
@@ -603,16 +254,19 @@ def train_models(X_train, y_train, window_size, num_features):
             if no_improve >= patience:
                 break
 
-    # Train CNN
+    # Train CNN with correct input shape
     optimizer = torch.optim.Adam(cnn_model.parameters())
     best_loss = float('inf')
     no_improve = 0
     
-    for epoch in range(20):  # Increased epochs
+    print("\nTraining CNN...")
+    for epoch in tqdm(range(20), desc="CNN epochs"):
         total_loss = 0
         for batch_X, batch_y in train_loader:
+            # Reshape input for CNN: (batch, seq_len, features) -> (batch, features, seq_len)
+            batch_X = batch_X.transpose(1, 2)
             optimizer.zero_grad()
-            outputs = cnn_model(batch_X.transpose(1, 2))
+            outputs = cnn_model(batch_X)
             loss = criterion(outputs, batch_y)
             loss.backward()
             optimizer.step()
@@ -632,7 +286,8 @@ def train_models(X_train, y_train, window_size, num_features):
     best_loss = float('inf')
     no_improve = 0
     
-    for epoch in range(20):  # Increased epochs
+    print("\nTraining Voting Model...")
+    for epoch in tqdm(range(20), desc="Voting Model epochs"):  # Increased epochs
         total_loss = 0
         for batch_X, batch_y in vote_loader:
             optimizer.zero_grad()
@@ -686,7 +341,6 @@ def main():
     # Parameters
     window_size = 30
     ticker = 'BTC/USDT'
-    timeframe = DataResolution.DAY_01
     timeframe = DataResolution.MINUTE_01
     path = os.path.join('output','hw6')
     os.makedirs(path, exist_ok=True)
@@ -708,23 +362,48 @@ def main():
     # Normalize features
     X_train_norm, X_val_norm, test_features_norm = normalize_features(X_train, X_val, test_features)
     
-    # Convert validation data to tensors
+    # Prepare sequence data for validation
     X_val_seq, y_val_seq = create_sequences(X_val_norm.values, y_val.values, window_size)
-    X_val_tensor = torch.FloatTensor(X_val_seq)
-    y_val_tensor = torch.LongTensor(y_val_seq)
+
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
     # Train models
-    lstm_model, cnn_model, voting_model = train_models(X_train_norm, y_train, window_size, num_features)
-    
+    print("\nTraining models...")
+    lstm_model, cnn_model, voting_model = train_models(X_train_norm, y_train, window_size, num_features, device)
+
     # Evaluate models on validation set
-    print("\nValidation Accuracies:")
-    lstm_acc = evaluate_model(lstm_model, X_val_tensor, y_val_tensor)
-    cnn_acc = evaluate_model(cnn_model, X_val_tensor, y_val_tensor)
-    voting_acc = evaluate_model(voting_model, torch.FloatTensor(X_val.values), torch.LongTensor(y_val.values))
-    print(f"LSTM Accuracy: {lstm_acc:.2%}")
-    print(f"CNN Accuracy: {cnn_acc:.2%}")
-    print(f"Voting Model Accuracy: {voting_acc:.2%}")
-    
+    print("\nEvaluating models on validation set...")
+    with torch.no_grad():
+        # Move validation data to device
+        X_val_tensor = torch.FloatTensor(X_val_seq).to(device)
+        X_val_tensor_cnn = X_val_tensor.transpose(1, 2)
+        y_val_tensor = torch.LongTensor(y_val_seq).to(device)
+        X_vote_val_tensor = torch.FloatTensor(X_val_norm.values).to(device)
+        y_vote_val_tensor = torch.LongTensor(y_val.values).to(device)
+        
+        # LSTM evaluation
+        lstm_model.eval()
+        lstm_pred = lstm_model(X_val_tensor)
+        lstm_pred = torch.argmax(lstm_pred, dim=1)
+        lstm_acc = (lstm_pred == y_val_tensor).float().mean().item()
+        print(f"LSTM Accuracy: {lstm_acc:.2%}")
+
+        # CNN evaluation
+        cnn_model.eval()
+        cnn_pred = cnn_model(X_val_tensor_cnn)
+        cnn_pred = torch.argmax(cnn_pred, dim=1)
+        cnn_acc = (cnn_pred == y_val_tensor).float().mean().item()
+        print(f"CNN Accuracy: {cnn_acc:.2%}")
+
+        # Voting model evaluation
+        voting_model.eval()
+        voting_pred = voting_model(X_vote_val_tensor)
+        voting_pred = torch.argmax(voting_pred, dim=1)
+        voting_acc = (voting_pred == y_vote_val_tensor).float().mean().item()
+        print(f"Voting Model Accuracy: {voting_acc:.2%}")
+
     # Create and run backtester
     backtester = SimpleBacktester(test_data, test_features_norm, lstm_model, cnn_model, voting_model)
     trades = backtester.run()

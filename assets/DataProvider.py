@@ -587,16 +587,19 @@ class DataProvider:
         return new_data
 
     def data_refresh(self):
-        for ticker in self.tickers:
-            ts = self.data[ticker].index[-1]
-            new_data = self.data_request_by_ticker(ticker, ts)
-            if new_data is not None and not new_data.empty:
-                existing_data = self.data[ticker] if ticker in self.data else None
-                self.data[ticker] = self.data_append(existing_data, new_data)
-                self.data_processed[ticker] = self.process_new_data(ticker, new_data)
-                # Update dashboards
-                self.create_data_dashboard(ticker)
-                self.create_features_dashboard(ticker)
+        try:
+            for ticker in self.tickers:
+                ts = self.data[ticker].index[-1]
+                new_data = self.data_request_by_ticker(ticker, ts)
+                if new_data is not None and not new_data.empty:
+                    existing_data = self.data[ticker] if ticker in self.data else None
+                    self.data[ticker] = self.data_append(existing_data, new_data)
+                    self.data_processed[ticker] = self.process_new_data(ticker, new_data)
+                    # Update dashboards
+                    self.create_data_dashboard(ticker)
+                    self.create_features_dashboard(ticker)
+        except Exception as e:
+            logging.error(f'Cant refresh data for {ticker}, b/c of {e}')
 
     def process_new_data(self, ticker, new_data: pd.DataFrame):
         # Load existing data if any
