@@ -1,0 +1,29 @@
+{
+    "terminal.integrated.shellIntegration.enabled": true,
+    "terminal.integrated.defaultProfile.windows": "PowerShell",
+    "terminal.integrated.profiles.windows": {
+        "PowerShell": {
+            "source": "PowerShell",
+            "icon": "terminal-powershell",
+            "args": ["-NoLogo", "-NoProfile"],
+            "env": {
+                "AGENT_MODE": "true"
+            }
+        }
+    },
+    "terminal.integrated.shellIntegration.decorationsEnabled": "both",
+    "terminal.integrated.enablePersistentSessions": false,
+    "terminal.integrated.persistentSessionReviveProcess": "never",
+    "terminal.integrated.automationProfile.windows": {
+        "path": "pwsh.exe",
+        "args": ["-NoLogo", "-NoProfile"],
+        "env": {
+            "AGENT_MODE": "true"
+        }
+    },
+    "terminal.integrated.environmentChangesIndicator": "on",
+    "terminal.integrated.shellIntegration.suggestEnabled": true,
+    "terminal.integrated.defaultLocation": "editor",
+    "terminal.integrated.gpuAcceleration": "on",
+    "terminal.integrated.showExitAlert": true
+}

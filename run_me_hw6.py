@@ -1,427 +1,315 @@
-from datetime import datetime
-from enum import Enum
-import os
-import platform
-from tqdm import tqdm
-
-# Clear terminal at start
-os.system('cls' if platform.system() == 'Windows' else 'clear')
-
-import numpy as np
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-
-from assets.DataProvider import DataProvider
-from assets.FeaturesGenerator import FeaturesGenerator
-from assets.enums import DataResolution
+from datetime import datetime, timedelta
+import streamlit as st
+from prophet import Prophet
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from stable_baselines3 import DQN, PPO, A2C
 from assets.hw6.SimpleBacktester import SimpleBacktester
+from assets.DataProvider import DataProvider
+from assets.enums import DataResolution, DataPeriod
 
-
-# Neural Network Models
-class SimpleLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size=128):
-        super(SimpleLSTM, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size, batch_first=True)
-        self.bn1 = nn.BatchNorm1d(hidden_size)
-        self.dropout1 = nn.Dropout(0.3)
-        self.lstm2 = nn.LSTM(hidden_size, hidden_size//2, batch_first=True)
-        self.bn2 = nn.BatchNorm1d(hidden_size//2)
-        self.dropout2 = nn.Dropout(0.3)
-        self.fc = nn.Linear(hidden_size//2, 2)
+# Model architectures
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 2)
     
     def forward(self, x):
-        x, _ = self.lstm1(x)
-        x = x[:, -1, :]
-        x = self.bn1(x)
-        x = self.dropout1(x)
-        x = x.unsqueeze(1)
-        x, _ = self.lstm2(x)
-        x = x[:, -1, :]
-        x = self.bn2(x)
-        x = self.dropout2(x)
+        lstm_out, _ = self.lstm(x)
+        return self.fc(lstm_out[:, -1, :])
+
+class CNNModel(nn.Module):
+    def __init__(self, input_channels, seq_length):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=3)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=3)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(128, 2)
+    
+    def forward(self, x):
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = self.pool(x).squeeze(-1)
         return self.fc(x)
 
-
-class SimpleCNN(nn.Module):
-    def __init__(self, input_channels, window_size):
-        super(SimpleCNN, self).__init__()
-        print(f"CNN init - input_channels: {input_channels}, window_size: {window_size}")
-        
-        # First convolution layer
-        self.conv1 = nn.Conv1d(input_channels, 32, kernel_size=3)
-        self.bn1 = nn.BatchNorm1d(32)
-        # Second convolution layer
-        self.conv2 = nn.Conv1d(32, 64, kernel_size=3)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.pool = nn.MaxPool1d(2)
-        self.dropout = nn.Dropout(0.3)
-        
-        # Calculate size after convolutions and pooling
-        # First conv reduces size by 2 (kernel_size=3)
-        conv1_size = window_size - 2
-        # Second conv reduces size by 2
-        conv2_size = conv1_size - 2
-        # MaxPool reduces size by half
-        pooled_size = conv2_size // 2
-        # Final flattened size
-        self.final_size = pooled_size * 64
-       
-        # Fully connected layers
-        self.fc1 = nn.Linear(self.final_size, 64)
-        self.fc2 = nn.Linear(64, 2)
+class TSMixerModel(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_classes=2):
+        super().__init__()
+        self.temporal_mix = nn.Linear(input_size, hidden_size)
+        self.feature_mix = nn.Linear(hidden_size, hidden_size)
+        self.output = nn.Linear(hidden_size, num_classes)
     
     def forward(self, x):
-        # First conv block
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = torch.relu(x)
-        
-        # Second conv block
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = torch.relu(x)
-        
-        # Pooling and dropout
-        x = self.pool(x)
-        x = self.dropout(x)
-        
-        # Flatten and reshape
-        x = x.reshape(x.size(0), -1)
-        
-        # Update final_size if needed
-        if self.final_size != x.size(1):
-            print(f"Warning: Expected size {self.final_size} but got {x.size(1)}")
-            self.final_size = x.size(1)
-            # Recreate the linear layer with correct size
-            self.fc1 = nn.Linear(self.final_size, 64)
-        
-        # Fully connected layers
-        x = torch.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
-
-
-class SimpleVotingModel(nn.Module):
-    def __init__(self, input_size):
-        super(SimpleVotingModel, self).__init__()
-        self.fc1 = nn.Linear(input_size, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, 64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.fc3 = nn.Linear(64, 2)
-        self.dropout = nn.Dropout(0.3)
-        self.relu = nn.ReLU()
-    
-    def forward(self, x):
-        x = self.relu(self.bn1(self.fc1(x)))
-        x = self.dropout(x)
-        x = self.relu(self.bn2(self.fc2(x)))
-        x = self.dropout(x)
-        return self.fc3(x)
-
-
-def prepare_data(ticker='BTC/USDT', resolution=DataResolution.DAY_01):
-    # Load data
-    data_provider = DataProvider(tickers=[ticker], skip_dashboard=True, resolution=resolution)
-    data_provider.data_load()
-    data_provider.data_refresh()
-    if ticker not in data_provider.data:
-        data_provider.data_request()
-        data_provider.clean_data()
-    data = data_provider.data[ticker]
-
-    # Generate features
-    features_gen = FeaturesGenerator()
-    feature_matrix, feature_names = features_gen.prepare_features(data)
-    
-    # Add market regime features
-    sma_50 = data['Close'].rolling(window=50).mean()
-    sma_200 = data['Close'].rolling(window=200).mean()
-    feature_matrix['trend'] = (sma_50 > sma_200).astype(float)
-    feature_matrix['trend_strength'] = ((sma_50 - sma_200) / sma_200 * 100)
-    
-    # Add volatility features
-    returns = data['Close'].pct_change()
-    feature_matrix['volatility_20'] = returns.rolling(window=20).std()
-    feature_matrix['volatility_50'] = returns.rolling(window=50).std()
-    
-    # Add momentum features
-    feature_matrix['momentum_14'] = returns.rolling(window=14).sum()
-    feature_matrix['momentum_30'] = returns.rolling(window=30).sum()
-    
-    # Generate forward returns for multiple horizons
-    forward_returns = {}
-    horizons = [1, 3, 5, 7]  # Multiple time horizons
-    
-    for horizon in horizons:
-        # Calculate forward returns
-        fwd_ret = data['Close'].pct_change(horizon).shift(-horizon)
-        # Calculate forward volatility
-        fwd_vol = fwd_ret.rolling(window=horizon).std()
-        # Calculate risk-adjusted returns
-        risk_adj_ret = fwd_ret / fwd_vol
-        forward_returns[horizon] = risk_adj_ret
-    
-    # Combine signals from multiple horizons
-    combined_signal = pd.Series(0, index=feature_matrix.index)
-    for horizon in horizons:
-        # Weight longer horizons more
-        weight = horizon / sum(horizons)
-        threshold = 0.2 / weight  # Adjust threshold based on horizon
-        # Align the forward returns with feature matrix index
-        aligned_returns = forward_returns[horizon].reindex(feature_matrix.index)
-        combined_signal += (aligned_returns > threshold).astype(int) * weight
-    
-    # Convert to binary classification with more stringent criteria
-    y = (combined_signal > 0.5).astype(int)
-    
-    # Clean up any NaN values
-    feature_matrix = feature_matrix.ffill().fillna(0)
-    
-    # Remove last few samples that don't have complete forward data
-    valid_mask = ~y.isnull()
-    
-    # Ensure all features are numeric
-    feature_matrix = feature_matrix.astype(float)
-    
-    return feature_matrix[valid_mask], y[valid_mask], data
-
-def create_sequences(features, targets, window_size):
-    if len(features) <= window_size:
-        raise ValueError(f"Not enough samples ({len(features)}) for window size {window_size}")
-    
-    # Create sequences using numpy operations for better performance
-    n_samples = len(features) - window_size
-    n_features = features.shape[1]
-    
-    X = np.zeros((n_samples, window_size, n_features))
-    y = np.zeros(n_samples)
-    
-    for i in range(n_samples):
-        X[i] = features[i:i + window_size]
-        y[i] = targets[i + window_size]
-    
-    return X, y
-
-def train_models(X_train, y_train, window_size, num_features, device):
-    # Prepare sequence data for neural networks
-    X_seq, y_seq = create_sequences(X_train.values, y_train.values, window_size)
-    X_tensor = torch.FloatTensor(X_seq).to(device)
-    y_tensor = torch.LongTensor(y_seq).to(device)
-    train_dataset = TensorDataset(X_tensor, y_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-
-    # Prepare data for voting model
-    X_vote_tensor = torch.FloatTensor(X_train.values).to(device)
-    y_vote_tensor = torch.LongTensor(y_train.values).to(device)
-    vote_dataset = TensorDataset(X_vote_tensor, y_vote_tensor)
-    vote_loader = DataLoader(vote_dataset, batch_size=32, shuffle=True)
-
-    # Initialize models and move to device
-    lstm_model = SimpleLSTM(num_features).to(device)
-    cnn_model = SimpleCNN(num_features, window_size).to(device)
-    voting_model = SimpleVotingModel(num_features).to(device)
-
-    # Train LSTM
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(lstm_model.parameters())
-    best_loss = float('inf')
-    patience = 5
-    no_improve = 0
-    
-    print("Training LSTM...")
-    for epoch in tqdm(range(20), desc="LSTM epochs"):  # Increased epochs
-        total_loss = 0
-        for batch_X, batch_y in train_loader:
-            optimizer.zero_grad()
-            outputs = lstm_model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(train_loader)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                break
-
-    # Train CNN with correct input shape
-    optimizer = torch.optim.Adam(cnn_model.parameters())
-    best_loss = float('inf')
-    no_improve = 0
-    
-    print("\nTraining CNN...")
-    for epoch in tqdm(range(20), desc="CNN epochs"):
-        total_loss = 0
-        for batch_X, batch_y in train_loader:
-            # Reshape input for CNN: (batch, seq_len, features) -> (batch, features, seq_len)
-            batch_X = batch_X.transpose(1, 2)
-            optimizer.zero_grad()
-            outputs = cnn_model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(train_loader)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                break
-
-    # Train Voting Model
-    optimizer = torch.optim.Adam(voting_model.parameters())
-    best_loss = float('inf')
-    no_improve = 0
-    
-    print("\nTraining Voting Model...")
-    for epoch in tqdm(range(20), desc="Voting Model epochs"):  # Increased epochs
-        total_loss = 0
-        for batch_X, batch_y in vote_loader:
-            optimizer.zero_grad()
-            outputs = voting_model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(vote_loader)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                break
-
-    return lstm_model, cnn_model, voting_model
-
-def evaluate_model(model, X, y):
-    model.eval()
-    with torch.no_grad():
-        outputs = model(X)
-        _, predicted = torch.max(outputs.data, 1)
-        accuracy = (predicted == y).sum().item() / len(y)
-    model.train()
-    return accuracy
-
-def normalize_features(train_features, val_features=None, test_features=None):
-    # Calculate mean and std on training data
-    train_mean = train_features.mean()
-    train_std = train_features.std()
-    train_std[train_std == 0] = 1  # Prevent division by zero
-    
-    # Normalize training data
-    train_normalized = (train_features - train_mean) / train_std
-    
-    # If validation/test data is provided, normalize it using training statistics
-    results = [train_normalized]
-    if val_features is not None:
-        val_normalized = (val_features - train_mean) / train_std
-        results.append(val_normalized)
-    if test_features is not None:
-        test_normalized = (test_features - train_mean) / train_std
-        results.append(test_normalized)
-    
-    return results
+        # x shape: (batch_size, input_size)
+        temp_mix = self.temporal_mix(x)
+        feat_mix = self.feature_mix(temp_mix)
+        return self.output(feat_mix)
 
 def main():
-    # Parameters
-    window_size = 30
-    ticker = 'BTC/USDT'
-    timeframe = DataResolution.MINUTE_01
-    path = os.path.join('output','hw6')
-    os.makedirs(path, exist_ok=True)
-
-    # Prepare data
-    features, targets, price_data = prepare_data(ticker, timeframe)
-    num_features = features.shape[1]
+    # Generate sample data for testing
+    print("Generating sample data...")
+    dates = pd.date_range(start='2023-01-01', end='2024-01-01', freq='1H')
+    np.random.seed(42)  # For reproducibility
     
-    # Split data (60% train, 20% validation, 20% test)
-    train_size = int(0.6 * len(features))
-    val_size = int(0.2 * len(features))
-    X_train = features[:train_size]
-    y_train = targets[:train_size]
-    X_val = features[train_size:train_size+val_size]
-    y_val = targets[train_size:train_size+val_size]
-    test_data = price_data.iloc[train_size+val_size:]
-    test_features = pd.DataFrame(features[train_size+val_size:], index=test_data.index)
+    # Generate synthetic price data with some realistic patterns
+    base_price = 30000
+    trend = np.linspace(0, 5000, len(dates))  # Upward trend
+    noise = np.random.normal(0, 500, len(dates))  # Random noise
+    seasonal = 1000 * np.sin(np.linspace(0, 10*np.pi, len(dates)))  # Seasonal pattern
+    
+    close_prices = base_price + trend + noise + seasonal
+    high_prices = close_prices + np.random.uniform(0, 200, len(dates))
+    low_prices = close_prices - np.random.uniform(0, 200, len(dates))
+    open_prices = close_prices + np.random.uniform(-100, 100, len(dates))
+    volumes = np.random.uniform(100, 1000, len(dates)) * (1 + 0.5 * np.sin(np.linspace(0, 8*np.pi, len(dates))))
+    
+    # Create DataFrame
+    data = pd.DataFrame({
+        'Open': open_prices,
+        'High': high_prices,
+        'Low': low_prices,
+        'Close': close_prices,
+        'Volume': volumes
+    }, index=dates)
+    
+    print(f"Generated {len(data)} data points")
+    
+    # Prepare features
+    features = prepare_features(data)
+    
+    # Initialize models
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    input_dim = features.shape[1]
+    seq_length = 60
+    
+    lstm_model = LSTMModel(input_dim).to(device)
+    cnn_model = CNNModel(input_dim, seq_length).to(device)
+    tsmixer_model = TSMixerModel(input_dim, seq_length).to(device)
+    
+    # Initialize Prophet model
+    prophet_model = Prophet(
+        changepoint_prior_scale=0.05,
+        seasonality_prior_scale=10,
+        seasonality_mode='multiplicative'
+    )
+    
+    # Create custom gym environment for RL agents
+    import gymnasium as gym
+    from gymnasium import spaces
+    
+    class TradingEnv(gym.Env):
+        def __init__(self, data, features):
+            super().__init__()
+            self.data = data
+            self.features = features
+            self.current_step = 0
+            
+            # Define action and observation spaces
+            self.action_space = spaces.Discrete(3)  # 0: hold, 1: buy, 2: sell
+            self.observation_space = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(features.shape[1],), dtype=np.float32
+            )
+        
+        def reset(self, seed=None):
+            super().reset(seed=seed)
+            self.current_step = 0
+            return self.features.iloc[self.current_step].values, {}
+        
+        def step(self, action):
+            # Execute action and get reward
+            reward = self._get_reward(action)
+            
+            # Move to next step
+            self.current_step += 1
+            done = self.current_step >= len(self.features) - 1
+            
+            # Get next observation
+            if not done:
+                next_obs = self.features.iloc[self.current_step].values
+            else:
+                next_obs = self.features.iloc[-1].values
+            
+            return next_obs, reward, done, False, {}
+        
+        def _get_reward(self, action):
+            current_price = self.data['Close'].iloc[self.current_step]
+            next_price = self.data['Close'].iloc[min(self.current_step + 1, len(self.data) - 1)]
+            price_change = (next_price - current_price) / current_price
+            
+            # Calculate volatility penalty
+            volatility = self.features['returns_vol'].iloc[self.current_step]
+            vol_penalty = -abs(volatility) * 0.1
+            
+            # Calculate trend alignment bonus
+            trend = self.features['momentum_20'].iloc[self.current_step]
+            trend_bonus = np.sign(trend) * abs(trend) * 0.05
+            
+            # Base reward
+            if action == 0:  # Hold
+                base_reward = 0
+            elif action == 1:  # Buy
+                base_reward = price_change
+            else:  # Sell
+                base_reward = -price_change
+            
+            # Add risk-adjusted components
+            total_reward = base_reward + vol_penalty + trend_bonus
+            
+            # Apply position sizing based on confidence
+            confidence = abs(self.features['adx'].iloc[self.current_step]) / 100
+            total_reward *= confidence
+            
+            return total_reward
+    
+    # Create environment
+    env = TradingEnv(data, features)
+    
+    # Initialize RL agents with the environment
+    print("Initializing RL agents...")
+    dqn_agent = DQN('MlpPolicy', env=env, verbose=1)
+    ppo_agent = PPO('MlpPolicy', env=env, verbose=1)
+    a2c_agent = A2C('MlpPolicy', env=env, verbose=1)
+    
+    # Train agents (just a few steps for demonstration)
+    print("Training RL agents...")
+    dqn_agent.learn(total_timesteps=1000)
+    ppo_agent.learn(total_timesteps=1000)
+    a2c_agent.learn(total_timesteps=1000)
+    
+    # Initialize sentiment analyzer
+    print("Initializing sentiment analyzer...")
+    tokenizer = AutoTokenizer.from_pretrained('ProsusAI/finbert')
+    sentiment_model = AutoModelForSequenceClassification.from_pretrained('ProsusAI/finbert')
+    
+    # Initialize backtester
+    backtester = SimpleBacktester(
+        data=data,
+        features=features,
+        lstm_model=lstm_model,
+        cnn_model=cnn_model,
+        voting_model=tsmixer_model
+    )
+    
+    # Run backtest
+    results = backtester.run()
+    
+    # Launch dashboard
+    launch_dashboard(results, backtester)
+
+def prepare_features(df):
+    features = pd.DataFrame(index=df.index)
+    
+    # Price action features
+    features['returns'] = df['Close'].pct_change()
+    features['returns_vol'] = features['returns'].rolling(window=20).std()
+    features['log_returns'] = np.log(df['Close']).diff()
+    
+    # Technical indicators with multiple timeframes
+    for window in [14, 30, 60]:
+        # RSI
+        features[f'rsi_{window}'] = ta.momentum.rsi(df['Close'], window=window)
+        
+        # Moving averages
+        features[f'sma_{window}'] = ta.trend.sma_indicator(df['Close'], window=window)
+        features[f'ema_{window}'] = ta.trend.ema_indicator(df['Close'], window=window)
+        
+        # Price distance from MA
+        features[f'ma_dist_{window}'] = (df['Close'] - features[f'sma_{window}']) / features[f'sma_{window}']
+    
+    # MACD with different parameters
+    macd = ta.trend.macd(df['Close'], window_slow=26, window_fast=12, window_sign=9)
+    features['macd'] = macd.iloc[:,0]
+    features['macd_signal'] = macd.iloc[:,1]
+    features['macd_hist'] = macd.iloc[:,2]
+    
+    # Bollinger Bands
+    for window in [20, 40]:
+        bb = ta.volatility.BollingerBands(df['Close'], window=window)
+        features[f'bb_position_{window}'] = (df['Close'] - bb.bollinger_lband()) / (bb.bollinger_hband() - bb.bollinger_lband())
+        features[f'bb_width_{window}'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+    
+    # Volatility indicators
+    features['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'])
+    features['natr'] = features['atr'] / df['Close']
+    
+    # Volume analysis
+    features['volume_sma'] = df['Volume'].rolling(window=20).mean()
+    features['volume_ratio'] = df['Volume'] / features['volume_sma']
+    features['volume_price_trend'] = features['volume_ratio'] * features['returns'].apply(np.sign)
+    
+    # Trend strength
+    features['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'])
+    features['cci'] = ta.trend.cci(df['High'], df['Low'], df['Close'])
+    
+    # Price patterns
+    features['high_low_ratio'] = df['High'] / df['Low']
+    features['close_position'] = (df['Close'] - df['Low']) / (df['High'] - df['Low'])
+    
+    # Momentum
+    for window in [10, 20, 30]:
+        features[f'momentum_{window}'] = df['Close'].diff(periods=window) / df['Close'].shift(window)
+        features[f'roc_{window}'] = ta.momentum.roc(df['Close'], window=window)
+    
+    # Fill NaN values with forward fill then backward fill
+    features = features.fillna(method='ffill').fillna(method='bfill').fillna(0)
     
     # Normalize features
-    X_train_norm, X_val_norm, test_features_norm = normalize_features(X_train, X_val, test_features)
+    for col in features.columns:
+        if col != 'returns':
+            features[col] = (features[col] - features[col].mean()) / features[col].std()
     
-    # Prepare sequence data for validation
-    X_val_seq, y_val_seq = create_sequences(X_val_norm.values, y_val.values, window_size)
+    return features
 
-    # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+def calculate_rsi(prices, period=14):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(prices):
+    exp1 = prices.ewm(span=12, adjust=False).mean()
+    exp2 = prices.ewm(span=26, adjust=False).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=9, adjust=False).mean()
+    return macd, signal
+
+def calculate_bollinger_bands(prices, period=20, std=2):
+    middle = prices.rolling(period).mean()
+    std_dev = prices.rolling(period).std()
+    upper = middle + std * std_dev
+    lower = middle - std * std_dev
+    return upper, middle, lower
+
+def launch_dashboard(results, backtester):
+    st.title('Trading Strategy Dashboard')
     
-    # Train models
-    print("\nTraining models...")
-    lstm_model, cnn_model, voting_model = train_models(X_train_norm, y_train, window_size, num_features, device)
-
-    # Evaluate models on validation set
-    print("\nEvaluating models on validation set...")
-    with torch.no_grad():
-        # Move validation data to device
-        X_val_tensor = torch.FloatTensor(X_val_seq).to(device)
-        X_val_tensor_cnn = X_val_tensor.transpose(1, 2)
-        y_val_tensor = torch.LongTensor(y_val_seq).to(device)
-        X_vote_val_tensor = torch.FloatTensor(X_val_norm.values).to(device)
-        y_vote_val_tensor = torch.LongTensor(y_val.values).to(device)
-        
-        # LSTM evaluation
-        lstm_model.eval()
-        lstm_pred = lstm_model(X_val_tensor)
-        lstm_pred = torch.argmax(lstm_pred, dim=1)
-        lstm_acc = (lstm_pred == y_val_tensor).float().mean().item()
-        print(f"LSTM Accuracy: {lstm_acc:.2%}")
-
-        # CNN evaluation
-        cnn_model.eval()
-        cnn_pred = cnn_model(X_val_tensor_cnn)
-        cnn_pred = torch.argmax(cnn_pred, dim=1)
-        cnn_acc = (cnn_pred == y_val_tensor).float().mean().item()
-        print(f"CNN Accuracy: {cnn_acc:.2%}")
-
-        # Voting model evaluation
-        voting_model.eval()
-        voting_pred = voting_model(X_vote_val_tensor)
-        voting_pred = torch.argmax(voting_pred, dim=1)
-        voting_acc = (voting_pred == y_vote_val_tensor).float().mean().item()
-        print(f"Voting Model Accuracy: {voting_acc:.2%}")
-
-    # Create and run backtester
-    backtester = SimpleBacktester(test_data, test_features_norm, lstm_model, cnn_model, voting_model)
-    trades = backtester.run()
+    # Performance metrics
+    st.header('Performance Metrics')
+    total_return = ((backtester.cash / backtester.initial_cash) - 1) * 100
+    win_rate = (backtester.winning_trades / backtester.total_trades * 100 
+                if backtester.total_trades > 0 else 0)
     
-    # Print results
-    if len(trades) > 0:
-        print(f"\nBacktesting Results:")
-        print(f"Number of trades: {len(trades)}")
-        print(f"Average PnL per trade: {trades['pnl'].mean():.2f}%")
-        print(f"Total return: {trades['pnl'].sum():.2f}%")
-        print(f"Win rate: {(trades['pnl'] > 0).mean() * 100:.1f}%")
-        
-        # Save trades to CSV
-        trades.to_csv(os.path.join(path, 'ensemble_trades.csv'))
-        print("\nTrades saved to 'ensemble_trades.csv'")
-    else:
-        print("No trades were executed during the test period.")
+    col1, col2, col3 = st.columns(3)
+    col1.metric('Total Return', f'{total_return:.2f}%')
+    col2.metric('Win Rate', f'{win_rate:.2f}%')
+    col3.metric('Max Drawdown', f'{backtester.max_drawdown:.2f}%')
+    
+    # Trade history
+    st.header('Trade History')
+    st.dataframe(results)
+    
+    # Equity curve
+    st.header('Equity Curve')
+    equity_curve = pd.DataFrame({
+        'Date': results['entry_time'],
+        'Equity': backtester.cash + results['pnl'].cumsum()
+    })
+    st.line_chart(equity_curve.set_index('Date'))
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
