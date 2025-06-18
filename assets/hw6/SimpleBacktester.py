@@ -83,34 +83,184 @@ class SimpleBacktester:
         return returns.rolling(window=window).std()
         
     def calculate_position_size(self, signal_strength, current_price, current_vol):
-        # Base position size as percentage of portfolio
-        risk_per_trade = 0.03  # 3% risk per trade
-        account_value = self.cash + sum(pos['size'] * current_price for pos in self.positions)
-        base_size = risk_per_trade * signal_strength
+        if signal_strength == 0:
+            return 0
         
-        # Adjust for volatility (less impact)
-        vol_percentile = current_vol / self.data['Close'].pct_change().std()
-        vol_factor = 1 / (1 + vol_percentile * 0.5)  # Less reduction for volatility
+        # Get current market context
+        current_time = self.data.index[-1]
+        volatility_regime = self.features['volatility_regime'].iloc[-1]
+        trend_strength = self.features['trend_strength'].iloc[-1]
         
-        # Calculate target position value
-        target_value = base_size * account_value * vol_factor
-        size = target_value / current_price
+        # Calculate portfolio metrics
+        portfolio_value = self.cash + sum(pos['size'] * current_price for pos in self.positions)
+        current_exposure = sum(pos['size'] * current_price for pos in self.positions) / portfolio_value
         
-        # Ensure minimum trade size of $1000
-        min_size = 1000 / current_price
-        size = max(size, min_size)
+        # Dynamic risk per trade based on market conditions
+        base_risk = 0.02  # Base risk of 2%
         
-        # Cap at max position size
-        size = min(size, self.max_position_btc)
+        # Adjust risk based on market regime
+        if volatility_regime == 'high':
+            risk_multiplier = 0.7  # Reduce risk in high volatility
+        elif volatility_regime == 'low':
+            risk_multiplier = 1.2  # Increase risk in low volatility
+        else:
+            risk_multiplier = 1.0
         
-        # Round to 3 decimal places
-        return round(size, 3)
+        # Adjust risk based on trend strength
+        if trend_strength > 25:
+            risk_multiplier *= 1.1  # Increase risk in strong trends
+        elif trend_strength < 15:
+            risk_multiplier *= 0.9  # Decrease risk in weak trends
+        
+        # Adjust risk based on current exposure
+        if current_exposure > 0.5:
+            risk_multiplier *= 0.8  # Reduce risk when heavily invested
+        
+        # Calculate final risk percentage
+        risk_per_trade = base_risk * risk_multiplier
+        risk_amount = portfolio_value * risk_per_trade
+        
+        # Dynamic stop loss calculation
+        atr = self.atr.loc[current_time]
+        volatility_stop = atr * 2.0  # Base stop at 2 ATR
+        
+        # Adjust stops based on volatility regime
+        if volatility_regime == 'high':
+            volatility_stop *= 1.5  # Wider stops in high volatility
+        elif volatility_regime == 'low':
+            volatility_stop *= 0.8  # Tighter stops in low volatility
+        
+        # Calculate position size based on risk and stop distance
+        size = (risk_amount / volatility_stop) * signal_strength
+        
+        # Position size constraints
+        max_position_value = portfolio_value * 0.25  # Max 25% of portfolio per position
+        size = min(size, max_position_value / current_price)
+        
+        # Adjust for remaining cash (leave buffer for fees)
+        available_cash = self.cash * 0.95  # Leave 5% buffer
+        size = min(size, available_cash / current_price)
+        
+        # Scale based on conviction
+        if signal_strength > 0.8:
+            size *= 1.2  # Increase size for high conviction trades
+        elif signal_strength < 0.6:
+            size *= 0.8  # Decrease size for lower conviction trades
+        
+        # Minimum position constraints
+        min_trade_value = 1000  # Minimum trade size in USD
+        min_size = min_trade_value / current_price
+        
+        # Final position size
+        size = max(min_size, min(size, self.max_position_size))
+        
+        # Round to 6 decimal places for crypto
+        size = round(size, 6)
+        
+        return size
         
     def run(self):
         self.trades = []
         self.positions = []
-        self.peak_value = self.initial_cash
-        self.max_drawdown = 0
+        
+        # Calculate volatility and ATR
+        volatility = self.calculate_volatility()
+        self.atr = self._calculate_atr(self.data)
+        
+        # Initialize portfolio value
+        self.portfolio_value = self.cash
+        
+        # Use tqdm for progress bar
+        for i in tqdm(range(self.window_size, len(self.data)), desc='Backtesting'):
+            current_data = self.data.iloc[:i+1]
+            current_price = current_data['Close'].iloc[-1]
+            current_time = current_data.index[-1]
+            current_vol = volatility.iloc[i] if i < len(volatility) else volatility.iloc[-1]
+            
+            # Update portfolio value
+            positions_value = sum(pos['size'] * current_price for pos in self.positions)
+            self.portfolio_value = self.cash + positions_value
+            
+            # Check stops and handle position exits
+            closed_positions = self.check_stops(current_data)
+            
+            # Get trading signal
+            signal = self._get_signal(current_data, self.features.iloc[:i+1])
+            
+            # Skip if max positions reached
+            if len(self.positions) >= self.max_positions:
+                continue
+            
+            # Calculate position size if signal exists
+            if signal > 0:
+                # Calculate dynamic stop levels
+                stop_loss_pct, take_profit_pct = self.get_dynamic_stops(current_price, current_time)
+                
+                # Calculate position size
+                position_size = self.calculate_position_size(signal, current_price, current_vol)
+                position_value = position_size * current_price
+                
+                # Apply position limits
+                max_trade_value = min(
+                    self.cash * 0.3,  # Max 30% of cash
+                    self.portfolio_value * 0.2,  # Max 20% of portfolio
+                    self.max_position_size * current_price  # Max BTC position
+                )
+                position_value = min(position_value, max_trade_value)
+                
+                # Skip if position too small
+                if position_value < 1000:  # Minimum $1000 position
+                    continue
+                
+                # Skip if not enough cash
+                if position_value > self.cash:
+                    continue
+                
+                # Calculate final position size
+                position_size = position_value / current_price
+                
+                # Print trade details
+                print(f"\nOpening position at {current_time}")
+                print(f"Price: ${current_price:.2f}, Size: {position_size:.3f} BTC")
+                print(f"Stop Loss: ${current_price * (1 - stop_loss_pct):.2f}")
+                print(f"Take Profit: ${current_price * (1 + take_profit_pct):.2f}")
+                
+                # Open position
+                self.positions.append({
+                    'entry_time': current_time,
+                    'entry_price': current_price,
+                    'size': position_size,
+                    'stop_price': current_price * (1 - stop_loss_pct),
+                    'take_profit': current_price * (1 + take_profit_pct),
+                    'high_water_mark': current_price,
+                    'trailing_stop': current_price * (1 - self.trailing_stop_pct),
+                    'entry_atr': self.atr.iloc[i],
+                    'entry_vol': current_vol,
+                    'initial_stop': current_price * (1 - stop_loss_pct),
+                    'highest_price': current_price
+                })
+                
+                # Update cash
+                self.cash -= current_price * position_size * (1 + self.commission)
+                
+                # Update peak value if new high
+                if self.portfolio_value > self.peak_value:
+                    self.peak_value = self.portfolio_value
+                
+                # Update max drawdown
+                drawdown = (self.peak_value - self.portfolio_value) / self.peak_value
+                self.max_drawdown = max(self.max_drawdown, drawdown)
+        
+        # Close any remaining positions
+        trades = self.close_positions(self.data)
+        
+        # Print final statistics
+        print("\nBacktest Complete")
+        print(f"Final Portfolio Value: ${self.portfolio_value:.2f}")
+        print(f"Return: {((self.portfolio_value / self.initial_cash) - 1) * 100:.2f}%")
+        print(f"Max Drawdown: {self.max_drawdown * 100:.2f}%")
+        
+        return trades
         
         # Calculate volatility and other risk metrics
         returns = self.data['Close'].pct_change()
@@ -172,7 +322,7 @@ class SimpleBacktester:
             max_trade_value = min(
                 self.cash * 0.3,  # Max 30% of cash
                 portfolio_value * 0.2,  # Max 20% of portfolio
-                self.max_position_btc * current_price  # Max BTC position
+                self.max_position_size * current_price  # Max BTC position
             )
             position_value = min(position_value, max_trade_value)
             
@@ -214,6 +364,157 @@ class SimpleBacktester:
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = ranges.max(axis=1)
         return true_range.rolling(window=period).mean()
+    
+    def _calculate_rsi(self, prices, period=14):
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+    
+    def _calculate_macd(self, prices):
+        exp1 = prices.ewm(span=12, adjust=False).mean()
+        exp2 = prices.ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
+        return macd, signal
+    
+    def _calculate_bollinger_bands(self, prices, period=20, std=2):
+        middle = prices.rolling(window=period).mean()
+        std_dev = prices.rolling(window=period).std()
+        upper = middle + (std_dev * std)
+        lower = middle - (std_dev * std)
+        return upper, middle, lower
+    
+    def _calculate_ema(self, prices, period):
+        return prices.ewm(span=period, adjust=False).mean()
+
+
+    def check_stops(self, data):
+        current_time = data.index[-1]
+        current_price = data['Close'].iloc[-1]
+        
+        # Update portfolio metrics
+        portfolio_value = self.cash + sum(pos['size'] * current_price for pos in self.positions)
+        self.peak_value = max(self.peak_value, portfolio_value)
+        
+        # Calculate drawdown
+        current_drawdown = (self.peak_value - portfolio_value) / self.peak_value * 100
+        self.max_drawdown = max(self.max_drawdown, current_drawdown)
+        
+        # Get market context
+        volatility_regime = self.features['volatility_regime'].iloc[-1]
+        trend_strength = self.features['trend_strength'].iloc[-1]
+        current_atr = self.atr.loc[current_time]
+        
+        # Portfolio-wide risk check
+        if current_drawdown > 15:  # Maximum drawdown threshold
+            self._close_all_positions(current_time, current_price, 'max_drawdown')
+            return
+        
+        # Check each position
+        for position in self.positions:
+            # Calculate unrealized P&L
+            unrealized_pnl = (current_price - position['entry_price']) / position['entry_price']
+            time_in_trade = (current_time - position['entry_time']).total_seconds() / 3600  # hours
+            
+            # Dynamic stop loss adjustment
+            initial_stop = position['initial_stop']
+            trailing_stop = position['trailing_stop']
+            
+            # Adjust stops based on profit and time
+            if unrealized_pnl > 0.02:  # In profit > 2%
+                # Tighten stops in profit
+                trailing_stop = max(trailing_stop * 0.8, initial_stop * 0.5)
+                
+                # Time-based stop adjustment
+                if time_in_trade > 48:  # After 48 hours
+                    trailing_stop = max(trailing_stop * 0.7, initial_stop * 0.4)
+            
+            # Volatility-based stop adjustment
+            current_vol = current_atr / current_price
+            if current_vol > position['entry_vol'] * 1.5:  # Volatility increased
+                trailing_stop *= 1.2  # Widen stops
+            elif current_vol < position['entry_vol'] * 0.7:  # Volatility decreased
+                trailing_stop *= 0.8  # Tighten stops
+            
+            # Update trailing stop if price moved in our favor
+            if current_price > position['highest_price']:
+                position['highest_price'] = current_price
+                new_stop = current_price * (1 - trailing_stop)
+                position['stop_price'] = max(position['stop_price'], new_stop)
+            
+            # Check stop conditions
+            stop_triggered = False
+            exit_reason = None
+            
+            # 1. Stop loss hit
+            if current_price <= position['stop_price']:
+                stop_triggered = True
+                exit_reason = 'stop_loss'
+            
+            # 2. Take profit hit
+            elif current_price >= position['entry_price'] * (1 + position['take_profit']):
+                stop_triggered = True
+                exit_reason = 'take_profit'
+            
+            # 3. Trend reversal exit
+            elif time_in_trade > 24:  # Only check after 24 hours
+                if trend_strength < 15 and unrealized_pnl > 0:
+                    stop_triggered = True
+                    exit_reason = 'trend_reversal'
+            
+            # 4. Volatility exit
+            if volatility_regime == 'high' and unrealized_pnl > 0.01:
+                stop_triggered = True
+                exit_reason = 'high_volatility'
+            
+            # Close position if any stop condition met
+            if stop_triggered:
+                self._close_position(position, current_time, current_price, exit_reason)
+    
+    def _close_position(self, position, current_time, current_price, reason):
+        """Helper method to close a single position"""
+        pnl = (current_price - position['entry_price']) * position['size']
+        pnl_pct = (current_price - position['entry_price']) / position['entry_price'] * 100
+        
+        closed_position = {
+            'entry_time': position['entry_time'],
+            'exit_time': current_time,
+            'entry_price': position['entry_price'],
+            'exit_price': current_price,
+            'size': position['size'],
+            'pnl': pnl_pct,
+            'exit_reason': reason,
+            'entry_atr': position['entry_atr'],
+            'entry_vol': position['entry_vol'],
+            'time_in_trade': (current_time - position['entry_time']).total_seconds() / 3600
+        }
+        
+        self.trades.append(closed_position)
+        self.cash += current_price * position['size'] * (1 - self.commission)
+        if position in self.positions:
+            self.positions.remove(position)
+        
+        # Update performance metrics
+        self.total_trades += 1
+        if pnl > 0:
+            self.winning_trades += 1
+        
+        print(f"{reason.upper()}: Closing position from {position['entry_time']} at {current_time}")
+        print(f"Entry: ${position['entry_price']:.2f}, Exit: ${current_price:.2f}")
+        print(f"P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
+    
+    def _close_all_positions(self, current_time, current_price, reason):
+        """Helper method to close all positions"""
+        positions_copy = self.positions.copy()
+        for position in positions_copy:
+            self._close_position(position, current_time, current_price, reason)
+            
+            # Clear positions
+            self.positions = []
+        
+        return pd.DataFrame(self.trades)
 
     def close_positions(self, data):
         # Close any remaining positions at the end
@@ -221,193 +522,184 @@ class SimpleBacktester:
             final_price = data['Close'].iloc[-1]
             final_time = data.index[-1]
             
-            for pos in self.positions:
-                pnl = (final_price - pos['entry_price']) * pos['size']
-                pnl_pct = (final_price - pos['entry_price']) / pos['entry_price'] * 100
+            for position in self.positions:
+                pnl = (final_price - position['entry_price']) * position['size']
+                pnl_pct = (final_price - position['entry_price']) / position['entry_price'] * 100
                 
-                self.trades.append({
-                    'entry_time': pos['entry_time'],
+                closed_position = {
+                    'entry_time': position['entry_time'],
                     'exit_time': final_time,
-                    'entry_price': pos['entry_price'],
+                    'entry_price': position['entry_price'],
                     'exit_price': final_price,
-                    'size': pos['size'],
+                    'size': position['size'],
                     'pnl': pnl_pct,
                     'exit_reason': 'end_of_period',
-                    'entry_atr': pos['entry_atr'],
-                    'entry_vol': pos['entry_vol']
-                })
+                    'entry_atr': position['entry_atr'],
+                    'entry_vol': position['entry_vol']
+                }
                 
-                self.cash += final_price * pos['size'] * (1 - self.commission)
+                self.trades.append(closed_position)
+                self.cash += final_price * position['size'] * (1 - self.commission)
+                
+                # Print trade details
+                print(f"END_OF_PERIOD: Closing position from {position['entry_time']} at {final_time}")
+                print(f"Entry: ${position['entry_price']:.2f}, Exit: ${final_price:.2f}")
+                print(f"P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
+            
+            # Clear positions
+            self.positions = []
         
         return pd.DataFrame(self.trades)
 
-    def check_stops(self, data):
-        positions_to_close = []
-        current_price = data['Close'].iloc[-1]
-        current_time = data.index[-1]
-        
-        for position in self.positions:
-            # Update high water mark for trailing stop
-            if current_price > position['high_water_mark']:
-                position['high_water_mark'] = current_price
-                # Update trailing stop to lock in profits
-                new_trailing_stop = current_price * (1 - self.trailing_stop_pct)
-                if 'trailing_stop' not in position or new_trailing_stop > position['trailing_stop']:
-                    position['trailing_stop'] = new_trailing_stop
-            
-            # Check take profit
-            if current_price >= position['take_profit']:
-                positions_to_close.append((position, 'take_profit'))
-                continue
-            
-            # Check stop loss
-            if current_price <= position['stop_loss']:
-                positions_to_close.append((position, 'stop_loss'))
-                continue
-            
-            # Check trailing stop
-            if 'trailing_stop' in position and current_price <= position['trailing_stop']:
-                positions_to_close.append((position, 'trailing_stop'))
-                continue
-        
-        # Close positions that hit stops
-        for position, reason in positions_to_close:
-            pnl = (current_price - position['entry_price']) * position['size']
-            pnl_pct = (current_price - position['entry_price']) / position['entry_price'] * 100
-            
-            print(f"{reason.upper()}: Closing position from {position['entry_time']} at {current_time}")
-            print(f"Entry: ${position['entry_price']:.2f}, Exit: ${current_price:.2f}")
-            print(f"P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
-            
-            # Add to trades list
-            self.trades.append({
-                'entry_time': position['entry_time'],
-                'exit_time': current_time,
-                'entry_price': position['entry_price'],
-                'exit_price': current_price,
-                'size': position['size'],
-                'pnl': pnl_pct,
-                'exit_reason': reason
-            })
-            
-            # Update cash (account for commission)
-            self.cash += current_price * position['size'] * (1 - self.commission)
-            self.positions.remove(position)
-
     def _get_signal(self, data, features):
-        # Get latest features
-        current_features = features.iloc[-1]
+        # Market regime analysis
+        volatility_regime = features['volatility_regime'].iloc[-1]
+        trend_strength = features['trend_strength'].iloc[-1]
+        trend_direction = features['trend_direction'].iloc[-1]
         
-        # Calculate RSI
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        rsi = rsi.iloc[-1]
-        
-        # Calculate MACD
-        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=9, adjust=False).mean()
-        macd = macd.iloc[-1]
-        macd_signal = signal.iloc[-1]
-        
-        # Calculate multiple moving averages
-        sma_20 = data['Close'].rolling(window=20).mean()
-        sma_50 = data['Close'].rolling(window=50).mean()
-        ema_9 = data['Close'].ewm(span=9, adjust=False).mean()
-        ema_21 = data['Close'].ewm(span=21, adjust=False).mean()
-        
-        # Calculate Bollinger Bands
-        bb_period = 20
-        bb_std = 2
-        bb_middle = data['Close'].rolling(window=bb_period).mean()
-        bb_std_dev = data['Close'].rolling(window=bb_period).std()
-        bb_upper = bb_middle + (bb_std_dev * bb_std)
-        bb_lower = bb_middle - (bb_std_dev * bb_std)
-        
-        # Calculate ATR for volatility
-        high_low = data['High'] - data['Low']
-        high_close = abs(data['High'] - data['Close'].shift())
-        low_close = abs(data['Low'] - data['Close'].shift())
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = ranges.max(axis=1)
-        atr = true_range.rolling(window=14).mean().iloc[-1]
-        
-        # Advanced trend indicators
-        price_above_sma = data['Close'].iloc[-1] > sma_20.iloc[-1] > sma_50.iloc[-1]  # Strong uptrend
-        ema_trend = ema_9.iloc[-1] > ema_21.iloc[-1]  # Short-term momentum
-        bb_position = (data['Close'].iloc[-1] - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1])  # 0 to 1
-        
-        # Volume trend
-        volume_sma = data['Volume'].rolling(window=20).mean()
-        volume_trend = data['Volume'].iloc[-1] > volume_sma.iloc[-1]
-        
-        # Calculate momentum indicators
-        returns = data['Close'].pct_change()
-        momentum_10 = returns.rolling(window=10).sum().iloc[-1]
-        momentum_bullish = (
-            rsi > 50 and  # RSI in bullish territory
-            macd > macd_signal and  # MACD bullish crossover
-            momentum_10 > 0 and  # Positive 10-period momentum
-            price_above_sma and  # Price above moving averages
-            ema_trend and  # Short-term trend up
-            volume_trend and  # Above average volume
-            bb_position > 0.5  # Price in upper half of Bollinger Bands
+        # Technical signals
+        rsi_signal = (
+            features['rsi_14'].iloc[-1],
+            features['rsi_14_slope'].iloc[-1],
+            features['rsi_14_ma'].iloc[-1]
         )
         
-        print(f"RSI: {rsi:.2f}, MACD: {macd:.2f}, MACD Signal: {macd_signal:.2f}")
-        print(f"BB Position: {bb_position:.2f}, ATR: {atr:.2f}")
-        print(f"Momentum bullish: {momentum_bullish}")
+        macd_signal = (
+            features['macd'].iloc[-1],
+            features['macd_signal'].iloc[-1],
+            features['macd_hist'].iloc[-1],
+            features['macd_hist_slope'].iloc[-1]
+        )
         
-        # Get model predictions with higher threshold
+        # Volume analysis
+        volume_signals = (
+            features['volume_ratio'].iloc[-1],
+            features['volume_price_trend'].iloc[-1],
+            features['volume_price_corr'].iloc[-1],
+        )
+        
+        # Price action patterns
+        price_patterns = (
+            features['body_size'].iloc[-1],
+            features['upper_shadow'].iloc[-1],
+            features['lower_shadow'].iloc[-1],
+            features['high_low_range'].iloc[-1]
+        )
+        
+        # Get model predictions with market regime context
         with torch.no_grad():
             self.lstm_model.eval()
             self.cnn_model.eval()
             self.voting_model.eval()
             
+            # Prepare sequence data
+            seq_data = features.iloc[-self.window_size:].values
+            
             # LSTM prediction
-            lstm_input = torch.FloatTensor(features.iloc[-self.window_size:].values).unsqueeze(0).to(self.device)
+            lstm_input = torch.FloatTensor(seq_data).unsqueeze(0).to(self.device)
             lstm_pred = self.lstm_model(lstm_input)
             
             # CNN prediction
-            cnn_input = torch.FloatTensor(features.iloc[-self.window_size:].values).unsqueeze(0).transpose(1, 2).to(self.device)
+            cnn_input = torch.FloatTensor(seq_data).unsqueeze(0).transpose(1, 2).to(self.device)
             cnn_pred = self.cnn_model(cnn_input)
             
             # Voting model prediction
-            voting_input = torch.FloatTensor(current_features.values).unsqueeze(0).to(self.device)
+            voting_input = torch.FloatTensor(seq_data[-1]).unsqueeze(0).to(self.device)
             voting_pred = self.voting_model(voting_input)
             
-            # Weighted ensemble prediction (give more weight to LSTM for time series)
+            # Dynamic model weighting based on market regime
+            if volatility_regime == 'high':
+                # In high volatility, trust LSTM more (better at sequences)
+                weights = (0.5, 0.25, 0.25)  # LSTM, CNN, Voting
+            elif volatility_regime == 'low':
+                # In low volatility, trust voting model more (better at mean reversion)
+                weights = (0.3, 0.3, 0.4)  # LSTM, CNN, Voting
+            else:
+                # In medium volatility, balanced weights
+                weights = (0.4, 0.3, 0.3)  # LSTM, CNN, Voting
+            
+            # Calculate regime-aware ensemble prediction
             ensemble_pred = (
-                lstm_pred.softmax(dim=1) * 0.4 +  # LSTM gets 40% weight
-                cnn_pred.softmax(dim=1) * 0.3 +  # CNN gets 30% weight
-                voting_pred.softmax(dim=1) * 0.3  # Voting gets 30% weight
+                lstm_pred.softmax(dim=1) * weights[0] +
+                cnn_pred.softmax(dim=1) * weights[1] +
+                voting_pred.softmax(dim=1) * weights[2]
             )
             
-            # Put models back in training mode
+            confidence = ensemble_pred[0][1].item()
+            
             self.lstm_model.train()
             self.cnn_model.train()
             self.voting_model.train()
         
-        # Get confidence from ensemble prediction
-        confidence = ensemble_pred[0][1].item()  # Probability of positive class
-        print(f"Model confidence: {confidence:.2f}")
+        # Signal strength calculation based on multiple factors
+        signal_strength = 0.0
         
-        # More conservative signal generation
-        if price_trend and momentum_bullish:  # Need both confirmations
-            if confidence > 0.60:  # Higher threshold
-                print("Taking full position")
-                return 1.0
-            elif confidence > 0.50:
-                print("Taking 75% position")
-                return 0.75
-            elif confidence > 0.45:
-                print("Taking 50% position")
-                return 0.5
+        # 1. Technical Analysis Score (30%)
+        tech_score = 0.0
+        # RSI conditions
+        if 30 <= rsi_signal[0] <= 70:  # Not overbought/oversold
+            tech_score += 0.3
+            if rsi_signal[1] > 0 and rsi_signal[0] > rsi_signal[2]:  # Positive slope and above MA
+                tech_score += 0.2
         
-        print("No position taken")
-        return 0
-
+        # MACD conditions
+        if macd_signal[2] > 0 and macd_signal[3] > 0:  # Positive histogram and slope
+            tech_score += 0.3
+        if macd_signal[0] > macd_signal[1]:  # MACD above signal
+            tech_score += 0.2
+        
+        # 2. Volume Analysis Score (20%)
+        vol_score = 0.0
+        if volume_signals[0] > 1.0:  # Above average volume
+            vol_score += 0.4
+        if volume_signals[1] > 0:  # Positive volume trend
+            vol_score += 0.3
+        
+        # 3. Price Action Score (20%)
+        price_score = 0.0
+        if price_patterns[0] > 0.001:  # Significant body size
+            price_score += 0.3
+        if price_patterns[2] < price_patterns[1]:  # Lower shadow < upper shadow (bullish)
+            price_score += 0.3
+        if price_patterns[3] < 0.02:  # Not too volatile
+            price_score += 0.4
+        
+        # 4. Model Confidence (30%)
+        model_score = confidence
+        
+        # Combine scores with weights
+        signal_strength = (
+            tech_score * 0.3 +
+            vol_score * 0.2 +
+            price_score * 0.2 +
+            model_score * 0.3
+        )
+        
+        # Apply market regime filters
+        if volatility_regime == 'high':
+            signal_strength *= 0.7  # Reduce position size in high volatility
+        if trend_strength < 20:  # Weak trend
+            signal_strength *= 0.8
+        if trend_direction == -1:  # Counter-trend
+            signal_strength *= 0.6
+        
+        # Dynamic thresholds based on market conditions
+        base_threshold = 0.5
+        if volatility_regime == 'high':
+            base_threshold = 0.6
+        elif volatility_regime == 'low':
+            base_threshold = 0.45
+        
+        # Final signal decision
+        if signal_strength > base_threshold + 0.2:
+            print(f"Strong signal: {signal_strength:.2f}")
+            return min(1.0, signal_strength)
+        elif signal_strength > base_threshold:
+            print(f"Moderate signal: {signal_strength:.2f}")
+            return min(0.75, signal_strength)
+        elif signal_strength > base_threshold - 0.1:
+            print(f"Weak signal: {signal_strength:.2f}")
+            return min(0.5, signal_strength)
+        
+        print(f"No signal: {signal_strength:.2f}")
+        return 0.0

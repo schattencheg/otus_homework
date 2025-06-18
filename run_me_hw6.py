@@ -10,6 +10,11 @@ from stable_baselines3 import DQN, PPO, A2C
 from assets.hw6.SimpleBacktester import SimpleBacktester
 from assets.DataProvider import DataProvider
 from assets.enums import DataResolution, DataPeriod
+from assets.FeaturesGenerator import FeaturesGenerator
+import ta
+import gymnasium as gym
+from gymnasium import spaces
+
 
 # Model architectures
 class LSTMModel(nn.Module):
@@ -203,28 +208,43 @@ def main():
 def prepare_features(df):
     features = pd.DataFrame(index=df.index)
     
+    features_generator = FeaturesGenerator()
+    ohlc_for_features = df[['Open', 'High', 'Low', 'Close']]
+    all_features_df, _ = features_generator.prepare_features(ohlc_for_features)
+    
     # Price action features
     features['returns'] = df['Close'].pct_change()
     features['returns_vol'] = features['returns'].rolling(window=20).std()
-    features['log_returns'] = np.log(df['Close']).diff()
-    
-    # Technical indicators with multiple timeframes
-    for window in [14, 30, 60]:
-        # RSI
-        features[f'rsi_{window}'] = ta.momentum.rsi(df['Close'], window=window)
-        
-        # Moving averages
+    vol_quantiles = features['returns_vol'].quantile([0.33, 0.66])
+    features['volatility_regime'] = pd.cut(features['returns_vol'],
+                                            bins=[-np.inf, vol_quantiles[0.33], vol_quantiles[0.66], np.inf],
+                                            labels=[0, 1, 2])  # 0: low, 1: medium, 2: high
+    features['body_size'] = (df['Close'] - df['Open']) / df['Open']
+    features['upper_shadow'] = (df['High'] - df['Close']) / df['Open']
+    features['lower_shadow'] = (df['Open'] - df['Low']) / df['Open']
+    features['high_low_range'] = df['High'] - df['Low']
+
+    # Calculate moving averages
+    for window in [5, 10, 20, 40]:
         features[f'sma_{window}'] = ta.trend.sma_indicator(df['Close'], window=window)
         features[f'ema_{window}'] = ta.trend.ema_indicator(df['Close'], window=window)
         
         # Price distance from MA
         features[f'ma_dist_{window}'] = (df['Close'] - features[f'sma_{window}']) / features[f'sma_{window}']
     
+    # RSI
+    features['rsi_14'] = ta.momentum.rsi(df['Close'], window=14)
+    features['rsi_14_slope'] = features['rsi_14'].diff()
+    features['rsi_14_ma'] = features['rsi_14'].rolling(window=5).mean()
+    
+    # MACD
     # MACD with different parameters
-    macd = ta.trend.macd(df['Close'], window_slow=26, window_fast=12, window_sign=9)
-    features['macd'] = macd.iloc[:,0]
-    features['macd_signal'] = macd.iloc[:,1]
-    features['macd_hist'] = macd.iloc[:,2]
+    macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
+    features['macd'] = macd.macd()
+    features['macd_signal'] = macd.macd_signal()
+    # Calculate MACD histogram as difference between MACD and signal line
+    features['macd_hist'] = features['macd'] - features['macd_signal']
+    features['macd_hist_slope'] = features['macd_hist'].diff()
     
     # Bollinger Bands
     for window in [20, 40]:
@@ -240,10 +260,17 @@ def prepare_features(df):
     features['volume_sma'] = df['Volume'].rolling(window=20).mean()
     features['volume_ratio'] = df['Volume'] / features['volume_sma']
     features['volume_price_trend'] = features['volume_ratio'] * features['returns'].apply(np.sign)
-    
+    features['volume_price_corr'] = df['Volume'].rolling(window=20).corr(df['Close'])
+
     # Trend strength
     features['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'])
     features['cci'] = ta.trend.cci(df['High'], df['Low'], df['Close'])
+    features['trend_strength'] = features['adx'] / 100  # Normalized trend strength
+    features['trend_direction'] = np.where(features['macd'] > features['macd_signal'], 1, -1)
+
+    # Volume profile analysis
+    features['volume_force'] = df['Volume'] * features['returns']
+    features['money_flow_index'] = ta.volume.money_flow_index(df['High'], df['Low'], df['Close'], df['Volume'])
     
     # Price patterns
     features['high_low_ratio'] = df['High'] / df['Low']
@@ -259,7 +286,7 @@ def prepare_features(df):
     
     # Normalize features
     for col in features.columns:
-        if col != 'returns':
+        if col != 'returns' and col != 'volatility_regime':
             features[col] = (features[col] - features[col].mean()) / features[col].std()
     
     return features
