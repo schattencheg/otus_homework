@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from datetime import datetime, timedelta
-import streamlit as st
+import matplotlib.pyplot as plt
 from prophet import Prophet
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from stable_baselines3 import DQN, PPO, A2C
@@ -40,6 +40,56 @@ class CNNModel(nn.Module):
         x = torch.relu(self.conv2(x))
         x = self.pool(x).squeeze(-1)
         return self.fc(x)
+
+class DeepCNNModel(nn.Module):
+    def __init__(self, input_channels, seq_length):
+        super().__init__()
+        
+        # Initial convolution
+        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(64)
+        
+        # Residual blocks
+        self.res_block1 = nn.Sequential(
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64)
+        )
+        
+        self.res_block2 = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128)
+        )
+        
+        # Adaptive pooling and final layers
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(128, 64)
+        self.fc2 = nn.Linear(64, 2)
+    
+    def forward(self, x):
+        # Initial conv
+        x = torch.relu(self.bn1(self.conv1(x)))
+        
+        # Residual blocks
+        identity = x
+        out = self.res_block1(x)
+        out += identity
+        out = torch.relu(out)
+        
+        out = self.res_block2(out)
+        
+        # Global pooling and final layers
+        out = self.pool(out).squeeze(-1)
+        out = self.dropout(out)
+        out = torch.relu(self.fc1(out))
+        out = self.fc2(out)
+        return out
 
 class TSMixerModel(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_classes=2):
@@ -93,6 +143,7 @@ def main():
     
     lstm_model = LSTMModel(input_dim).to(device)
     cnn_model = CNNModel(input_dim, seq_length).to(device)
+    deep_cnn_model = DeepCNNModel(input_dim, seq_length).to(device)
     tsmixer_model = TSMixerModel(input_dim, seq_length).to(device)
     
     # Initialize Prophet model
@@ -149,23 +200,45 @@ def main():
             volatility = self.features['returns_vol'].iloc[self.current_step]
             vol_penalty = -abs(volatility) * 0.1
             
-            # Calculate trend alignment bonus
-            trend = self.features['momentum_20'].iloc[self.current_step]
-            trend_bonus = np.sign(trend) * abs(trend) * 0.05
+            # Calculate trend alignment using multiple timeframes
+            trend_short = self.features['momentum_20'].iloc[self.current_step]
+            trend_medium = self.features['momentum_40'].iloc[self.current_step]
+            trend_long = self.features['momentum_60'].iloc[self.current_step]
             
-            # Base reward
+            # Trend alignment bonus increases when multiple timeframes align
+            trend_alignment = (np.sign(trend_short) == np.sign(trend_medium)) and (np.sign(trend_medium) == np.sign(trend_long))
+            trend_bonus = np.sign(trend_medium) * abs(trend_medium) * (0.1 if trend_alignment else 0.03)
+            
+            # Base reward with momentum scaling and reduced risk
             if action == 0:  # Hold
-                base_reward = 0
+                base_reward = price_change * 0.1  # Small reward for holding in profitable conditions
             elif action == 1:  # Buy
-                base_reward = price_change
+                # Only buy if trend alignment is strong
+                if trend_alignment and trend_medium > 0:
+                    momentum_scale = 1 + min(abs(trend_medium), 0.5)  # Cap momentum scale
+                    base_reward = price_change * momentum_scale
+                else:
+                    base_reward = price_change * 0.5  # Reduced reward for non-aligned trades
             else:  # Sell
-                base_reward = -price_change
+                if trend_alignment and trend_medium < 0:
+                    momentum_scale = 1 + min(abs(trend_medium), 0.5)  # Cap momentum scale
+                    base_reward = -price_change * momentum_scale
+                else:
+                    base_reward = -price_change * 0.5  # Reduced reward for non-aligned trades
             
-            # Add risk-adjusted components
-            total_reward = base_reward + vol_penalty + trend_bonus
+            # Add risk-adjusted components with stricter volatility scaling
+            vol_scale = 1.0
+            if self.features['volatility_regime'].iloc[self.current_step] == 'high':
+                vol_scale = 0.5  # Further reduce exposure in high volatility
+            elif self.features['volatility_regime'].iloc[self.current_step] == 'low':
+                vol_scale = 1.1  # Slightly increase exposure in low volatility
             
-            # Apply position sizing based on confidence
-            confidence = abs(self.features['adx'].iloc[self.current_step]) / 100
+            total_reward = (base_reward + vol_penalty + trend_bonus) * vol_scale
+            
+            # Apply position sizing based on trend strength and ADX
+            trend_strength = abs(trend_medium)
+            adx_confidence = self.features['adx'].iloc[self.current_step] / 100
+            confidence = (trend_strength * 0.7 + adx_confidence * 0.3)  # Weighted confidence
             total_reward *= confidence
             
             return total_reward
@@ -190,20 +263,28 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained('ProsusAI/finbert')
     sentiment_model = AutoModelForSequenceClassification.from_pretrained('ProsusAI/finbert')
     
-    # Initialize backtester
+    # Initialize backtester with optimized parameters
     backtester = SimpleBacktester(
         data=data,
         features=features,
         lstm_model=lstm_model,
         cnn_model=cnn_model,
+        deep_cnn_model=deep_cnn_model,
         voting_model=tsmixer_model
     )
+    
+    # Override default risk parameters
+    backtester.max_positions = 2  # Reduce max concurrent positions
+    backtester.max_position_size = 0.25  # Reduce position size to 25%
+    backtester.base_stop_loss_pct = 0.02  # Tighter stop loss at 2%
+    backtester.trailing_stop_pct = 0.01  # Tighter trailing stop at 1%
+    backtester.risk_per_trade = 0.01  # Risk only 1% per trade
     
     # Run backtest
     results = backtester.run()
     
-    # Launch dashboard
-    launch_dashboard(results, backtester)
+    # Plot results
+    plot_results(results, backtester)
 
 def prepare_features(df):
     features = pd.DataFrame(index=df.index)
@@ -215,8 +296,12 @@ def prepare_features(df):
     # Price action features
     features['returns'] = df['Close'].pct_change()
     features['returns_vol'] = features['returns'].rolling(window=20).std()
-    vol_quantiles = features['returns_vol'].quantile([0.33, 0.66])
-    features['volatility_regime'] = pd.cut(features['returns_vol'],
+    features['returns_vol_long'] = features['returns'].rolling(window=50).std()
+    
+    # Volatility regime using both short and long-term volatility
+    vol_ratio = features['returns_vol'] / features['returns_vol_long']
+    vol_quantiles = vol_ratio.quantile([0.33, 0.66])
+    features['volatility_regime'] = pd.cut(vol_ratio,
                                             bins=[-np.inf, vol_quantiles[0.33], vol_quantiles[0.66], np.inf],
                                             labels=[0, 1, 2])  # 0: low, 1: medium, 2: high
     features['body_size'] = (df['Close'] - df['Open']) / df['Open']
@@ -276,10 +361,18 @@ def prepare_features(df):
     features['high_low_ratio'] = df['High'] / df['Low']
     features['close_position'] = (df['Close'] - df['Low']) / (df['High'] - df['Low'])
     
-    # Momentum
-    for window in [10, 20, 30]:
+    # Enhanced momentum features with multiple timeframes
+    for window in [10, 20, 30, 40, 60]:
+        # Standard momentum
         features[f'momentum_{window}'] = df['Close'].diff(periods=window) / df['Close'].shift(window)
         features[f'roc_{window}'] = ta.momentum.roc(df['Close'], window=window)
+        
+        # Exponential momentum (gives more weight to recent price changes)
+        features[f'ema_momentum_{window}'] = ta.trend.ema_indicator(features[f'momentum_{window}'], window=window//2)
+        
+        # Momentum divergence (difference between price momentum and volume momentum)
+        vol_momentum = df['Volume'].diff(periods=window) / df['Volume'].shift(window)
+        features[f'momentum_divergence_{window}'] = features[f'momentum_{window}'] - vol_momentum
     
     # Fill NaN values with forward fill then backward fill
     features = features.fillna(method='ffill').fillna(method='bfill').fillna(0)
@@ -312,31 +405,40 @@ def calculate_bollinger_bands(prices, period=20, std=2):
     lower = middle - std * std_dev
     return upper, middle, lower
 
-def launch_dashboard(results, backtester):
-    st.title('Trading Strategy Dashboard')
+def plot_results(results, backtester):
+    # Create figure with subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [2, 1]})
     
     # Performance metrics
-    st.header('Performance Metrics')
     total_return = ((backtester.cash / backtester.initial_cash) - 1) * 100
     win_rate = (backtester.winning_trades / backtester.total_trades * 100 
                 if backtester.total_trades > 0 else 0)
     
-    col1, col2, col3 = st.columns(3)
-    col1.metric('Total Return', f'{total_return:.2f}%')
-    col2.metric('Win Rate', f'{win_rate:.2f}%')
-    col3.metric('Max Drawdown', f'{backtester.max_drawdown:.2f}%')
-    
-    # Trade history
-    st.header('Trade History')
-    st.dataframe(results)
-    
-    # Equity curve
-    st.header('Equity Curve')
+    # Plot equity curve
     equity_curve = pd.DataFrame({
         'Date': results['entry_time'],
         'Equity': backtester.cash + results['pnl'].cumsum()
     })
-    st.line_chart(equity_curve.set_index('Date'))
+    equity_curve.set_index('Date')['Equity'].plot(ax=ax1, color='blue', label='Equity Curve')
+    ax1.set_title(f'Strategy Performance (Return: {total_return:.2f}%, Win Rate: {win_rate:.2f}%, Max DD: {backtester.max_drawdown:.2f}%)')
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel('Portfolio Value ($)')
+    ax1.grid(True)
+    ax1.legend()
+    
+    # Plot drawdown
+    equity_series = equity_curve['Equity']
+    rolling_max = equity_series.expanding().max()
+    drawdown = (equity_series - rolling_max) / rolling_max * 100
+    drawdown.plot(ax=ax2, color='red', label='Drawdown')
+    ax2.set_title('Portfolio Drawdown')
+    ax2.set_xlabel('Date')
+    ax2.set_ylabel('Drawdown (%)')
+    ax2.grid(True)
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == '__main__':
     main()

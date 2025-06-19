@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 
 class SimpleBacktester:
-    def __init__(self, data, features, lstm_model, cnn_model, voting_model):
+    def __init__(self, data, features, lstm_model, cnn_model, deep_cnn_model, voting_model):
         self.data = data
         self.features = features
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -13,6 +13,7 @@ class SimpleBacktester:
         # Move models to device
         self.lstm_model = lstm_model.to(self.device)
         self.cnn_model = cnn_model.to(self.device)
+        self.deep_cnn_model = deep_cnn_model.to(self.device)
         self.voting_model = voting_model.to(self.device)
         
         # Initialize portfolio
@@ -607,28 +608,33 @@ class SimpleBacktester:
             voting_input = torch.FloatTensor(seq_data[-1]).unsqueeze(0).to(self.device)
             voting_pred = self.voting_model(voting_input)
             
+            # Get deep CNN prediction
+            deep_cnn_pred = self.deep_cnn_model(cnn_input)
+            
             # Dynamic model weighting based on market regime
             if volatility_regime == 'high':
-                # In high volatility, trust LSTM more (better at sequences)
-                weights = (0.5, 0.25, 0.25)  # LSTM, CNN, Voting
+                # In high volatility, trust LSTM and Deep CNN more
+                weights = (0.35, 0.15, 0.35, 0.15)  # LSTM, CNN, Deep CNN, Voting
             elif volatility_regime == 'low':
-                # In low volatility, trust voting model more (better at mean reversion)
-                weights = (0.3, 0.3, 0.4)  # LSTM, CNN, Voting
+                # In low volatility, trust voting and CNN models more
+                weights = (0.2, 0.25, 0.2, 0.35)  # LSTM, CNN, Deep CNN, Voting
             else:
-                # In medium volatility, balanced weights
-                weights = (0.4, 0.3, 0.3)  # LSTM, CNN, Voting
+                # In medium volatility, balanced weights with slight preference to Deep CNN
+                weights = (0.25, 0.2, 0.3, 0.25)  # LSTM, CNN, Deep CNN, Voting
             
             # Calculate regime-aware ensemble prediction
             ensemble_pred = (
                 lstm_pred.softmax(dim=1) * weights[0] +
                 cnn_pred.softmax(dim=1) * weights[1] +
-                voting_pred.softmax(dim=1) * weights[2]
+                deep_cnn_pred.softmax(dim=1) * weights[2] +
+                voting_pred.softmax(dim=1) * weights[3]
             )
             
             confidence = ensemble_pred[0][1].item()
             
             self.lstm_model.train()
             self.cnn_model.train()
+            self.deep_cnn_model.train()
             self.voting_model.train()
         
         # Signal strength calculation based on multiple factors
