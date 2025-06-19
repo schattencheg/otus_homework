@@ -12,10 +12,12 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from xgboost import XGBClassifier
 from assets.DataProvider import DataProvider
 from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataPeriod, DataResolution
@@ -261,39 +263,91 @@ y = y.values
 X = X[:-1]
 y = y[:-1]
 
+# Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
 # Print shapes for debugging
-print(f"X shape: {X.shape}, y shape: {y.shape}")
+print(f"X shape: {X_scaled.shape}, y shape: {y.shape}")
 
 # Split data
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random_state=SEED)
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.15, random_state=SEED)
 
-# Create base models
+# Use RobustScaler for better handling of outliers in financial data
+robust_scaler = RobustScaler()
+X_robust = robust_scaler.fit_transform(X_scaled)
+
+# Create optimized base models focusing on strong performers
 base_models = {
-    'Logistic Regression': LogisticRegression(),
-    'Random Forest': RandomForestClassifier(n_estimators=50, random_state=SEED),
-    'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, random_state=SEED),
-    'CNN': CNNClassifier(input_shape=X.shape[1], random_state=SEED)
+    'XGBoost': XGBClassifier(
+        n_estimators=200,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=SEED
+    ),
+    'Random Forest': RandomForestClassifier(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_split=5,
+        class_weight='balanced',
+        bootstrap=True,
+        random_state=SEED
+    ),
+    'Gradient Boosting': GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        random_state=SEED
+    ),
+    'CNN': CNNClassifier(
+        input_shape=X_robust.shape[1],
+        random_state=SEED,
+        conv1_filters=128,
+        conv2_filters=256,
+        dense_units=128,
+        dropout_rate=0.4
+    )
 }
 
-# Create voting ensemble with soft voting (since CNN outputs probabilities)
-voting_clf = VotingClassifier(estimators=[
-    ('lr', base_models['Logistic Regression']),
-    ('rf', base_models['Random Forest']),
-    ('gb', base_models['Gradient Boosting']),
-    ('cnn', base_models['CNN'])], voting='soft')
+# Create stacking ensemble with optimized meta-classifier
+stacking_clf = StackingClassifier(
+    estimators=[
+        ('xgb', base_models['XGBoost']),
+        ('rf', base_models['Random Forest']),
+        ('gb', base_models['Gradient Boosting']),
+        ('cnn', base_models['CNN'])
+    ],
+    final_estimator=XGBClassifier(
+        n_estimators=100,
+        max_depth=3,
+        learning_rate=0.1,
+        random_state=SEED
+    ),
+    cv=5,
+    n_jobs=-1
+)
 
 # Train all models
 model_metrics = {}
 evaluator = ModelEvaluator()
 
 # Train and evaluate base models
+print("Training base models...")
 for name, model in base_models.items():
+    print(f"Training {name}...")
     model.fit(X_train, y_train)
-    model_metrics[name] = evaluator.evaluate_model(model, X_test, y_test)
+    metrics = evaluator.evaluate_model(model, X_test, y_test)
+    model_metrics[name] = metrics
+    print(f"{name} performance: {metrics}")
 
-# Train and evaluate ensemble
-voting_clf.fit(X_train, y_train)
-model_metrics['Voting Ensemble'] = evaluator.evaluate_model(voting_clf, X_test, y_test)
+# Train and evaluate stacking ensemble
+print("\nTraining Stacking Ensemble...")
+stacking_clf.fit(X_train, y_train)
+model_metrics['Stacking Ensemble'] = evaluator.evaluate_model(stacking_clf, X_test, y_test)
+print(f"Stacking Ensemble performance: {model_metrics['Stacking Ensemble']}")
 
 # Print metrics
 print("\nModel Performance Metrics:")
