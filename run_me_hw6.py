@@ -67,6 +67,126 @@ class SyntheticDataLoader(DataLoaderBase):
         )
         return X, y
 
+class CNNClassifier:
+    """CNN classifier that follows scikit-learn's estimator interface"""
+    
+    def __init__(self, input_shape: int = None, random_state: int = None,
+                 epochs: int = 10, batch_size: int = 32,
+                 conv1_filters: int = 32, conv2_filters: int = 64,
+                 dense_units: int = 64, dropout_rate: float = 0.5):
+        self.input_shape = input_shape
+        self.random_state = random_state
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.conv1_filters = conv1_filters
+        self.conv2_filters = conv2_filters
+        self.dense_units = dense_units
+        self.dropout_rate = dropout_rate
+        self.classes_ = None
+        self.model = None
+        
+    def get_params(self, deep: bool = True) -> dict:
+        """Get parameters for this estimator.
+
+        Parameters
+        ----------
+        deep : bool, default=True
+            If True, will return the parameters for this estimator and
+            contained subobjects that are estimators.
+
+        Returns
+        -------
+        params : dict
+            Parameter names mapped to their values.
+        """
+        return {
+            'input_shape': self.input_shape,
+            'random_state': self.random_state,
+            'epochs': self.epochs,
+            'batch_size': self.batch_size,
+            'conv1_filters': self.conv1_filters,
+            'conv2_filters': self.conv2_filters,
+            'dense_units': self.dense_units,
+            'dropout_rate': self.dropout_rate
+        }
+    
+    def set_params(self, **params) -> 'CNNClassifier':
+        """Set the parameters of this estimator.
+
+        Returns
+        -------
+        self : object
+            Returns the instance itself.
+        """
+        for key, value in params.items():
+            if not hasattr(self, key):
+                raise ValueError(f'Invalid parameter {key} for estimator {self.__class__.__name__}')
+            setattr(self, key, value)
+        return self
+        
+    def _build_model(self):
+        if self.random_state is not None:
+            tf.random.set_seed(self.random_state)
+            
+        model = tf.keras.Sequential([
+            layers.Reshape((self.input_shape, 1), input_shape=(self.input_shape,)),
+            layers.Conv1D(self.conv1_filters, 3, activation='relu', padding='same'),
+            layers.MaxPooling1D(2),
+            layers.Conv1D(self.conv2_filters, 3, activation='relu', padding='same'),
+            layers.MaxPooling1D(2),
+            layers.Flatten(),
+            layers.Dense(self.dense_units, activation='relu'),
+            layers.Dropout(self.dropout_rate),
+            layers.Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        return model
+    
+    @property
+    def _estimator_type(self):
+        return "classifier"
+    
+    def fit(self, X, y):
+        """Fit the model to the data"""
+        # Initialize model if not already done
+        if self.model is None:
+            self.model = self._build_model()
+            
+        # Store unique classes
+        self.classes_ = np.unique(y)
+        if len(self.classes_) != 2:
+            raise ValueError("CNNClassifier only supports binary classification")
+            
+        # Convert labels to 0/1
+        y_binary = (y == self.classes_[1]).astype('float32')
+        
+        # Fit the model
+        self.model.fit(
+            X, y_binary,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            verbose=0
+        )
+        return self
+    
+    def predict_proba(self, X):
+        """Predict class probabilities"""
+        if self.model is None:
+            raise ValueError("Model has not been fitted yet.")
+        
+        probs = self.model.predict(X, verbose=0).flatten()
+        return np.column_stack([1 - probs, probs])
+    
+    def predict(self, X):
+        """Predict class labels"""
+        probas = self.predict_proba(X)
+        return self.classes_[np.argmax(probas, axis=1)]
+
 class ModelEvaluator:
     """Evaluate and compare model performances"""
     
@@ -135,14 +255,16 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random
 base_models = {
     'Logistic Regression': LogisticRegression(),
     'Random Forest': RandomForestClassifier(n_estimators=50, random_state=SEED),
-    'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, random_state=SEED)
+    'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, random_state=SEED),
+    'CNN': CNNClassifier(input_shape=X.shape[1], random_state=SEED)
 }
 
-# Create voting ensemble
+# Create voting ensemble with soft voting (since CNN outputs probabilities)
 voting_clf = VotingClassifier(estimators=[
     ('lr', base_models['Logistic Regression']),
     ('rf', base_models['Random Forest']),
-    ('gb', base_models['Gradient Boosting'])], voting='hard')
+    ('gb', base_models['Gradient Boosting']),
+    ('cnn', base_models['CNN'])], voting='soft')
 
 # Train all models
 model_metrics = {}
