@@ -1,33 +1,24 @@
+from abc import ABC, abstractmethod
 import os
 import random
-from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple, Union
-
-import backtesting
-from backtesting import Strategy, Backtest
-from backtesting.lib import crossover
+from typing import Dict, Tuple
+import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.datasets import make_classification
-from sklearn.ensemble import (AdaBoostClassifier, GradientBoostingClassifier, RandomForestClassifier,
-                            StackingClassifier, VotingClassifier)
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.svm import SVC
-from sklearn.tree import DecisionTreeClassifier
 import tensorflow as tf
-from tensorflow.keras import layers
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm.auto import tqdm
-import yfinance as yf
-import warnings
+import torch.nn.functional as F
 
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+from assets.DataProvider import DataProvider
+from assets.FeaturesGenerator import FeaturesGenerator
+from assets.enums import DataPeriod, DataResolution
 warnings.filterwarnings('ignore')
 
 # Set environment variable for deterministic PyTorch behavior
@@ -129,15 +120,15 @@ class CNNClassifier:
             tf.random.set_seed(self.random_state)
             
         model = tf.keras.Sequential([
-            layers.Reshape((self.input_shape, 1), input_shape=(self.input_shape,)),
-            layers.Conv1D(self.conv1_filters, 3, activation='relu', padding='same'),
-            layers.MaxPooling1D(2),
-            layers.Conv1D(self.conv2_filters, 3, activation='relu', padding='same'),
-            layers.MaxPooling1D(2),
-            layers.Flatten(),
-            layers.Dense(self.dense_units, activation='relu'),
-            layers.Dropout(self.dropout_rate),
-            layers.Dense(1, activation='sigmoid')
+            tf.keras.layers.Reshape((self.input_shape, 1), input_shape=(self.input_shape,)),
+            tf.keras.layers.Conv1D(self.conv1_filters, 3, activation='relu', padding='same'),
+            tf.keras.layers.MaxPooling1D(2),
+            tf.keras.layers.Conv1D(self.conv2_filters, 3, activation='relu', padding='same'),
+            tf.keras.layers.MaxPooling1D(2),
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dense(self.dense_units, activation='relu'),
+            tf.keras.layers.Dropout(self.dropout_rate),
+            tf.keras.layers.Dense(1, activation='sigmoid')
         ])
         
         model.compile(
@@ -238,17 +229,42 @@ def seed_everything(seed: int = 42) -> None:
 # Set the seed
 seed_everything(SEED)
 
-# Initialize data loader
-data_loader = SyntheticDataLoader(
-    n_samples=1_000,
-    n_features=4,
-    n_informative=2,
-    n_redundant=2,
-    random_state=SEED
+# Initialize data provider
+data_provider = DataProvider(
+    tickers=['BTC/USDT'],
+    resolution=DataResolution.DAY_01,
+    period=DataPeriod.YEAR_01
 )
 
-# Load and split data
-X, y = data_loader.load_data()
+# Load and process data
+data_provider.data_load()
+#data_provider.clean_data()
+
+# Get processed data and prepare features
+df = data_provider.data_processed['BTC/USDT']
+
+# Generate labels first
+y = (df['Returns'].shift(-1) > 0).astype(int)
+
+# Generate features
+features_generator = FeaturesGenerator()
+features, feature_names = features_generator.prepare_features(df)
+
+# Align the data - use the same index as features
+y = y[features.index]
+
+# Convert to numpy arrays
+X = features.values
+y = y.values
+
+# Remove the last row since we can't predict it
+X = X[:-1]
+y = y[:-1]
+
+# Print shapes for debugging
+print(f"X shape: {X.shape}, y shape: {y.shape}")
+
+# Split data
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random_state=SEED)
 
 # Create base models
