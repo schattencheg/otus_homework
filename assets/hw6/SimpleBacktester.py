@@ -611,24 +611,30 @@ class SimpleBacktester:
             # Get deep CNN prediction
             deep_cnn_pred = self.deep_cnn_model(cnn_input)
             
-            # Dynamic model weighting based on market regime
-            if volatility_regime == 'high':
-                # In high volatility, trust LSTM and Deep CNN more
-                weights = (0.35, 0.15, 0.35, 0.15)  # LSTM, CNN, Deep CNN, Voting
-            elif volatility_regime == 'low':
-                # In low volatility, trust voting and CNN models more
-                weights = (0.2, 0.25, 0.2, 0.35)  # LSTM, CNN, Deep CNN, Voting
-            else:
-                # In medium volatility, balanced weights with slight preference to Deep CNN
-                weights = (0.25, 0.2, 0.3, 0.25)  # LSTM, CNN, Deep CNN, Voting
+            # Democratic voting system
+            lstm_vote = torch.argmax(lstm_pred.softmax(dim=1)).item()
+            cnn_vote = torch.argmax(cnn_pred.softmax(dim=1)).item()
+            deep_cnn_vote = torch.argmax(deep_cnn_pred.softmax(dim=1)).item()
             
-            # Calculate regime-aware ensemble prediction
-            ensemble_pred = (
-                lstm_pred.softmax(dim=1) * weights[0] +
-                cnn_pred.softmax(dim=1) * weights[1] +
-                deep_cnn_pred.softmax(dim=1) * weights[2] +
-                voting_pred.softmax(dim=1) * weights[3]
-            )
+            # Count votes
+            buy_votes = sum([1 for vote in [lstm_vote, cnn_vote, deep_cnn_vote] if vote == 1])
+            sell_votes = 3 - buy_votes  # Total votes minus buy votes
+            
+            # Calculate confidence based on vote agreement
+            if buy_votes > sell_votes:
+                confidence = buy_votes / 3  # 2/3 or 3/3
+                ensemble_pred = torch.tensor([[1 - confidence, confidence]], device=self.device)
+            elif sell_votes > buy_votes:
+                confidence = sell_votes / 3  # 2/3 or 3/3
+                ensemble_pred = torch.tensor([[confidence, 1 - confidence]], device=self.device)
+            else:
+                # Tie - use market regime to break it
+                if volatility_regime == 'high':
+                    ensemble_pred = torch.tensor([[0.6, 0.4]], device=self.device)  # Slightly bearish in high volatility
+                elif volatility_regime == 'low':
+                    ensemble_pred = torch.tensor([[0.4, 0.6]], device=self.device)  # Slightly bullish in low volatility
+                else:
+                    ensemble_pred = torch.tensor([[0.5, 0.5]], device=self.device)  # Neutral in medium volatility
             
             confidence = ensemble_pred[0][1].item()
             
