@@ -183,3 +183,5 @@ temp/
 backtest_plots/
 
 otus-ssh-key/
+
+data/metrics/
