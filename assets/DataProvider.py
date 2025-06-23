@@ -378,7 +378,8 @@ class DataProvider:
             showlegend=True)
 
         # Save the dashboard
-        self.dashboard_features.write_html(os.path.join(self.dir_dashboard, f'{self.tickers_path[ticker]}_features_dashboard.html'))
+        self.dashboard_features.write_html(os.path.join(self.dir_dashboard, f'{self.tickers_path[ticker]}_features_dashboard.html'), 
+            auto_open=False)
 
     def dashboard_data_draw(self):
         self.dashboard_data.update_layout(height=800, width=1200, title_text='')
@@ -399,7 +400,7 @@ class DataProvider:
             DataResolution.MINUTE_01: '1min',
             DataResolution.MINUTE_05: '5min',
             DataResolution.MINUTE_15: '15min',
-            DataResolution.HOUR_01: '1H',
+            DataResolution.HOUR_01: '1h',
             DataResolution.DAY_01: '1D',
             DataResolution.WEEK_01: '1W'
         }
@@ -429,8 +430,9 @@ class DataProvider:
                 self.data[ticker] = df
                 self.data_processed[ticker] = self.process_new_data(ticker, df)
                 # Update dashboard
-                self.create_data_dashboard(ticker)
-                self.create_features_dashboard(ticker)
+                if False:
+                    self.create_data_dashboard(ticker)
+                    self.create_features_dashboard(ticker)
         return bool(self.data_processed)
 
     def data_load_by_ticker(self, ticker):
@@ -577,7 +579,7 @@ class DataProvider:
         if ticker not in self.tickers:
             return None
 
-        if ticker in self.data:
+        if ticker in self.data and False:
             return self.data[ticker]
 
         # Get new data
@@ -589,15 +591,16 @@ class DataProvider:
     def data_refresh(self):
         try:
             for ticker in self.tickers:
-                ts = self.data[ticker].index[-1]
+                ts = self.data[ticker].index[-1] if ticker in self.data and len(self.data[ticker]) > 0 else None
                 new_data = self.data_request_by_ticker(ticker, ts)
                 if new_data is not None and not new_data.empty:
                     existing_data = self.data[ticker] if ticker in self.data else None
                     self.data[ticker] = self.data_append(existing_data, new_data)
                     self.data_processed[ticker] = self.process_new_data(ticker, new_data)
                     # Update dashboards
-                    self.create_data_dashboard(ticker)
-                    self.create_features_dashboard(ticker)
+                    if False:
+                        self.create_data_dashboard(ticker)
+                        self.create_features_dashboard(ticker)
         except Exception as e:
             logging.error(f'Cant refresh data for {ticker}, b/c of {e}')
 

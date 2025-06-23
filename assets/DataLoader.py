@@ -94,7 +94,8 @@ class DataLoaderCCXT(DataLoaderBase):
             DataResolution.DAY_01: '1d',
             DataResolution.DAY_05: '5d',
             DataResolution.MONTH_01: '1mo',
-            DataResolution.MONTH_03: '3mo'
+            DataResolution.MONTH_03: '3mo',
+            DataResolution.HOUR_01: '1h'
         }
         return resolution_map.get(self.resolution, '1d')
 

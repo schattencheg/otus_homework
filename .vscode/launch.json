@@ -39,6 +39,12 @@
             "request": "launch",
             "program": "run_me_hw6.py",
             "console": "integratedTerminal"
+        },
+        {   "name": "Debug: HW_7",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "run_me_hw7.py",
+            "console": "integratedTerminal"
         }
     ]
 }
