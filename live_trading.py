@@ -106,7 +106,7 @@ class LiveTrader:
                     amount=0.01,  # Trade with 0.01 BTC
                     params={'type': 'future'}
                 )
-                print(f"{datetime.now()}: Opened LONG position")
+                logging.info(f"Opened LONG position")
                 
             elif signal == 0 and current_position >= 0:
                 # Close position or go short
@@ -115,7 +115,7 @@ class LiveTrader:
                     amount=0.01,  # Trade with 0.01 BTC
                     params={'type': 'future'}
                 )
-                print(f"{datetime.now()}: Opened SHORT position")
+                logging.info(f"Opened SHORT position")
                 
         except Exception as e:
             print(f"Error executing trade: {e}")
@@ -143,8 +143,8 @@ class LiveTrader:
                 # Get account balance
                 balance = self.exchange.fetch_balance()
                 total_balance = balance['total']['USDT']
-                print(f"Current balance: {total_balance:.2f} USDT")
-                print(f"Current prediction: {prediction:.4f}")
+                logging.info(f"Current balance: {total_balance:.2f} USDT")
+                logging.info(f"Current prediction: {prediction:.4f}")
                 
                 # Wait for next interval
                 time.sleep(interval_seconds)
@@ -160,10 +160,23 @@ def main():
     # Load your API credentials
     api_key = os.getenv('BINANCE_API_KEY')
     api_secret = os.getenv('BINANCE_API_SECRET')
+    model_path = os.getenv('MODEL_PATH', 'models/cnn_trader.pth')
     
     if not api_key or not api_secret:
         print("Please set BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
         return
+    
+    # Configure logging
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join('data', 'trading.log')),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
     
     model_path = 'models/cnn_trader.pth'
     trader = LiveTrader(model_path, api_key, api_secret)

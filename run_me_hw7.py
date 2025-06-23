@@ -17,8 +17,13 @@ from assets.DataProvider import DataProvider, DataResolution, DataPeriod
 from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataPeriod, DataResolution
 
-# Create models directory if it doesn't exist
+# Create necessary directories
 os.makedirs('models', exist_ok=True)
+os.makedirs('data', exist_ok=True)
+
+# Configure matplotlib for non-interactive backend
+import matplotlib
+matplotlib.use('Agg')
 
 class CNNModel(nn.Module):
     def __init__(self, input_channels: int, sequence_length: int):
@@ -145,7 +150,9 @@ def plot_strategy_performance(data: pd.DataFrame, strategy_results: Dict[str, An
     ax2.grid(True)
     
     plt.tight_layout()
-    plt.show()
+    # Save plots instead of showing them when running in Docker
+    plt.savefig(os.path.join('data', 'strategy_performance.png'))
+    plt.close()
 
 def save_model(model: nn.Module, metadata: Dict[str, Any], filepath: str):
     """Save model state and metadata to file"""
