@@ -13,11 +13,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
-from assets.DataProvider import DataProvider
+from assets.DataProvider import DataProvider, DataResolution, DataPeriod
 from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataPeriod, DataResolution
 
-
+# Create models directory if it doesn't exist
+os.makedirs('models', exist_ok=True)
 
 class CNNModel(nn.Module):
     def __init__(self, input_channels: int, sequence_length: int):
@@ -146,11 +147,20 @@ def plot_strategy_performance(data: pd.DataFrame, strategy_results: Dict[str, An
     plt.tight_layout()
     plt.show()
 
+def save_model(model: nn.Module, metadata: Dict[str, Any], filepath: str):
+    """Save model state and metadata to file"""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    state = {
+        'model_state_dict': model.state_dict(),
+        'metadata': metadata
+    }
+    torch.save(state, filepath)
+
 def main():
     # Initialize components with specific configuration
     data_provider = DataProvider(
         tickers=['BTC/USDT'],
-        resolution=DataResolution.DAY_01,
+        resolution=DataResolution.HOUR_01,
         period=DataPeriod.YEAR_01,
         skip_dashboard=True  # Skip dashboard creation to avoid potential errors
     )
@@ -274,8 +284,26 @@ def main():
     
     print(f"\nStrategy Performance:")
     print(f"Final Balance: ${results['final_balance']:.2f}")
-    print(f"Return: {results['return']:.2f}%")
+    print(f"Return: {((results['final_balance'] / 100000 - 1) * 100):.2f}%")
     print(f"Number of Trades: {len(results['trades'])}")
+    
+    # Save model and metadata
+    metadata = {
+        'input_channels': n_features,
+        'sequence_length': sequence_length,
+        'threshold': strategy.threshold,
+        'feature_names': feature_names,
+        'training_date': pd.Timestamp.now().strftime('%Y-%m-%d'),
+        'performance': {
+            'final_balance': results['final_balance'],
+            'return': ((results['final_balance'] / 100000 - 1) * 100),
+            'n_trades': len(results['trades'])
+        }
+    }
+    
+    model_path = os.path.join('models', 'cnn_trader.pth')
+    save_model(model, metadata, model_path)
+    print(f"\nModel saved to {model_path}")
     
     # Plot results
     plot_strategy_performance(data.iloc[-len(X_test)-sequence_length:], results)
