@@ -17,11 +17,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-
+from assets.Position import Position
+from assets.Order import Order
 from assets.DataProvider import DataPeriod, DataProvider, DataResolution
 from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataPeriod, DataResolution
-
+pd.options.mode.chained_assignment = None  # default='warn'
 
 #os.environ['BINANCE_API_KEY'] = 'QvAaxE0hMuqjKSzGxE625DudfJ3F0N6cdYqqePUiAu1lm5wAwyKTOE3b285AM0VQ'
 os.environ['BINANCE_API_KEY'] = '58403be0fa92d27e90d5a259d0ae4d054ba73d2110ecc8d7586648bdb8961dd6'
@@ -168,13 +169,14 @@ def plot_strategy_performance(data: pd.DataFrame, strategy_results: Dict[str, An
 def get_position(exchange: ccxt.Exchange) -> float:
     """Get current position size. Positive for long, negative for short, 0 for no position."""
     try:
+        result = None
         positions = exchange.fetch_positions(['BTC/USDT'])
         for position in positions:
-            if position['symbol'] == 'BTC/USDT':
+            if position['symbol'] == 'BTC/USDT:USDT':
                 size = float(position['contracts'] or 0)
                 side = 1 if position['side'] == 'long' else -1
-                return size * side
-        return 0.0
+                result = position
+        return result
     except Exception as e:
         logging.error(f"Error fetching position: {e}")
         if 'not authenticated' in str(e).lower():
@@ -197,12 +199,13 @@ def execute_trade(exchange: ccxt.Exchange, side: str, amount: float):
             logging.info(f"Closed existing {-current_position} position")
         
         # Open new position
-        exchange.create_market_order(
+        order_dict = exchange.create_market_order(
             symbol='BTC/USDT',
             side=side,
             amount=amount,
             params={'type': 'future'}
         )
+        order = Order(order_dict)
         logging.info(f"Opened new {side} position of size {amount}")
     except Exception as e:
         logging.error(f"Error executing {side} trade: {e}")
@@ -325,32 +328,37 @@ def run_live_trading(model_path: str, data_provider: DataProvider, features_gene
     while True:
         try:
             # Get latest data
-            data_provider.data_request()
-            data = data_provider.data['BTC/USDT']
-            data.columns = [col.capitalize() for col in data.columns]
-            
-            # Generate features
-            features_df, _ = features_generator.prepare_features(data)
-            features = torch.FloatTensor(features_df.values[-metadata['sequence_length']:]).unsqueeze(0).transpose(1, 2)
-            
-            # Generate trading signal
-            signal = strategy.generate_signals(features)[0]
-            
-            # Execute trade
-            current_position = get_position(exchange)
-            if signal == 1 and current_position <= 0:
-                execute_trade(exchange, 'buy', 0.01)
-                logging.info("Opened LONG position")
-            elif signal == 0 and current_position >= 0:
-                execute_trade(exchange, 'sell', 0.01)
-                logging.info("Opened SHORT position")
-            
-            # Log status
-            balance = exchange.fetch_balance()
-            total_balance = balance['total']['USDT']
-            logging.info(f"Balance: {total_balance:.2f} USDT, Signal: {signal}, Position: {current_position}")
-            
-            time.sleep(3600)  # Wait 1 hour
+            data_provider.data_refresh()
+            if data_provider.has_new_data:
+                data = data_provider.data['BTC/USDT']
+                new_data = data.iloc[-1][['Open','High','Low','Close']]
+                data.columns = [col.capitalize() for col in data.columns]
+                
+                # Generate features
+                features_df, _ = features_generator.prepare_features(data)
+                features = torch.FloatTensor(features_df.values[-metadata['sequence_length']:]).unsqueeze(0).transpose(1, 2)
+                
+                # Generate trading signal
+                signal = strategy.generate_signals(features)[0]
+                
+                # Execute trade
+                current_position: Position = Position(get_position(exchange))
+                current_position_size = current_position.contracts * current_position.side
+                event_taken = False
+                if signal == 1 and current_position_size <= 0:
+                    execute_trade(exchange, 'buy', 0.01)
+                    logging.info("Opened LONG position")
+                    event_taken = True
+                elif signal == 0 and current_position_size >= 0:
+                    execute_trade(exchange, 'sell', 0.01)
+                    logging.info("Opened SHORT position")
+                    event_taken = True
+                # Log status
+                if event_taken:
+                    balance = exchange.fetch_balance()
+                    total_balance = balance['total']['USDT']
+                    logging.info(f"Balance: {total_balance:.2f} USDT, Signal: {signal}, Position: {current_position_size:.5f}")
+            time.sleep(60)  # Wait 1 minute
             
         except KeyboardInterrupt:
             logging.info("Stopping live trading...")
@@ -489,7 +497,7 @@ def main():
     # Initialize components
     data_provider = DataProvider(
         tickers=['BTC/USDT'],
-        resolution=DataResolution.HOUR_01,
+        resolution=DataResolution.MINUTE_01,
         period=DataPeriod.YEAR_01,
         skip_dashboard=True
     )

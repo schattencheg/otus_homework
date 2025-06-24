@@ -30,6 +30,7 @@ class DataProvider:
         self.ts: dt.date = ts
         self.te: dt.date = te
         #
+        self._has_new_data = False
         self.data: Dict[str, pd.DataFrame] = {}
         self.data_processed: Dict[str, pd.DataFrame] = {}
         self.data_loader: DataLoaderBase = DataLoaderCCXT(tickers, resolution, period, ts, te)
@@ -451,7 +452,14 @@ class DataProvider:
     def data_save_by_ticker(self, ticker):
         if not os.path.exists(self.dir_data):
             os.makedirs(self.dir_data)
-        self.data[ticker].to_csv(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv')), index=True)
+        df = None
+        if ticker in self.data_processed:
+            df = self.data_processed[ticker]
+        elif ticker in self.data:
+            df = self.data[ticker]
+        else:
+            return
+        df.to_csv(self.sanitize_path(os.path.join(self.dir_data, self.tickers_path[ticker] + '.csv')), index=True)
 
     def data_save_by_ticker_and_df(self, ticker, df: pd.DataFrame):
         if not os.path.exists(self.dir_data):
@@ -490,7 +498,7 @@ class DataProvider:
         def drop_nones(ticker: str, df: pd.DataFrame):
             if df is None or df.empty:
                 return df
-            df = df.dropna()
+            df = df.dropna(subset=['Open','High','Low','Close'])
             rows_dropped = initial_rows - len(df)
             if rows_dropped > 0:
                 logging.info(f'Dropped {rows_dropped} rows with None values for {ticker}')
@@ -517,8 +525,8 @@ class DataProvider:
             valid_mask = pd.Series(True, index=df.index)
             for col in price_columns:
                 # Рассчитываем МА(window)
-                rolling_mean = df[col].rolling(window=window, center=True).mean()
-                rolling_std = df[col].rolling(window=window, center=True).std()
+                rolling_mean = df[col].rolling(window=window, center=True, min_periods=1).mean()
+                rolling_std = df[col].rolling(window=window, center=True, min_periods=1).std()
                 # Рассчет отклонения
                 z_scores = np.abs((df[col] - rolling_mean) / rolling_std)
                 # Убираем из фильтра неподходящие значения
@@ -566,6 +574,7 @@ class DataProvider:
             try:
                 new_data = self.data_request_by_ticker(ticker, ts)
                 if new_data is not None and not new_data.empty:
+                    self._has_new_data = True
                     self.data[ticker] = new_data
                     self.data_processed[ticker] = self.process_new_data(ticker, new_data)
                     # Record initial metrics
@@ -592,11 +601,21 @@ class DataProvider:
         try:
             for ticker in self.tickers:
                 ts = self.data[ticker].index[-1] if ticker in self.data and len(self.data[ticker]) > 0 else None
+                #print(f'Requesting data from {ts}')
                 new_data = self.data_request_by_ticker(ticker, ts)
+                if ticker in self.data and len(self.data[ticker]):
+                    new_data = new_data[new_data.isin(self.data[ticker]) == False].dropna()
                 if new_data is not None and not new_data.empty:
+                    #print(f'Received {len(new_data)} records')
+                    self._has_new_data = True
+                    logging.info(f'Received data for {new_data.index[-1]}')
                     existing_data = self.data[ticker] if ticker in self.data else None
-                    self.data[ticker] = self.data_append(existing_data, new_data)
-                    self.data_processed[ticker] = self.process_new_data(ticker, new_data)
+                    data = self.data_append(existing_data, new_data)
+                    self.data_processed[ticker] = self.process_new_data(ticker, data)
+                    # Replace existing data with processed data
+                    self.data[ticker] = self.data_processed[ticker][['Open', 'High', 'Low', 'Close', 'Volume']]
+                    #print(f'Processed {len(self.data[ticker])} records')
+                    self.data_save()
                     # Update dashboards
                     if False:
                         self.create_data_dashboard(ticker)
@@ -611,10 +630,10 @@ class DataProvider:
             existing_data = self.data[ticker]
             if existing_data is not None:
                 existing_data.columns = [x.capitalize() for x in existing_data.columns]
+        # Merge with existing data if any
+        processed_data = self.data_append(existing_data, new_data)
         # Process new data
         processed_data = self.process_data(ticker, new_data)
-        # Merge with existing data if any
-        processed_data = self.data_append(existing_data, processed_data)
         return processed_data
 
     def data_append(self, existing_data, new_data):
@@ -645,4 +664,9 @@ class DataProvider:
         elif self.period == DataPeriod.YEAR_10:
             days = 120 * 4 * 7
         return days
-#endregion
+
+    @property
+    def has_new_data(self):
+        result = self._has_new_data
+        self._has_new_data = False
+        return result

@@ -44,7 +44,8 @@
             "type": "debugpy",
             "request": "launch",
             "program": "run_me_hw7.py",
-            "console": "integratedTerminal"
+            "console": "integratedTerminal",
+            "args": ["live"]
         }
     ]
 }
