@@ -1,12 +1,12 @@
 version: '3.8'
 
 services:
-  trainer:
+  backtest:
     build: .
     volumes:
       - ./data:/app/data
       - ./models:/app/models
-    command: python run_me_hw7.py
+    command: python run_me_hw7.py backtest
     environment:
       - PYTHONUNBUFFERED=1
       - MATPLOTLIB_BACKEND=Agg
@@ -16,10 +16,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./models:/app/models
-    command: python live_trading.py
+    command: python run_me_hw7.py live
     environment:
       - PYTHONUNBUFFERED=1
       - BINANCE_API_KEY=${BINANCE_API_KEY}
       - BINANCE_API_SECRET=${BINANCE_API_SECRET}
-      - MODEL_PATH=/app/models/cnn_trader.pth
     restart: unless-stopped

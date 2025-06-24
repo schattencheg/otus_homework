@@ -36,9 +36,13 @@ BINANCE_API_SECRET=your_api_secret
 
 ## Usage with Docker
 
-1. Build and run the training container:
+1. Train and backtest the model:
 ```bash
-docker-compose up trainer
+# Run with Docker
+docker-compose up backtest
+
+# Or run directly
+python run_me_hw7.py backtest
 ```
 This will:
 - Load historical BTC/USDT data
@@ -46,9 +50,13 @@ This will:
 - Save the model to `models/cnn_trader.pth`
 - Save performance plots to `data/strategy_performance.png`
 
-2. Run live trading container:
+2. Run live trading:
 ```bash
+# Run with Docker
 docker-compose up -d trader
+
+# Or run directly
+python run_me_hw7.py live
 ```
 This will:
 - Load the trained model

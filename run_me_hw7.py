@@ -1,28 +1,39 @@
+import logging
 import os
+import sys
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
+
+import ccxt
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime, timedelta
-from typing import List, Tuple, Dict, Any
-
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 
-from assets.DataProvider import DataProvider, DataResolution, DataPeriod
+from assets.DataProvider import DataPeriod, DataProvider, DataResolution
 from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataPeriod, DataResolution
+
+
+#os.environ['BINANCE_API_KEY'] = 'QvAaxE0hMuqjKSzGxE625DudfJ3F0N6cdYqqePUiAu1lm5wAwyKTOE3b285AM0VQ'
+os.environ['BINANCE_API_KEY'] = '58403be0fa92d27e90d5a259d0ae4d054ba73d2110ecc8d7586648bdb8961dd6'
+#os.environ['BINANCE_API_SECRET'] = 'i6mFGnlCk06tCbaQbVIrvFSNUc2xlhD9q5aULYZBFWSQbGLTJywsjzQNKOPOXXAb'
+os.environ['BINANCE_API_SECRET'] = '7082231dc0ce924912648aa83048f3650b32d5f50df52e722078a447d96fa05a'
 
 # Create necessary directories
 os.makedirs('models', exist_ok=True)
 os.makedirs('data', exist_ok=True)
 
 # Configure matplotlib for non-interactive backend
-import matplotlib
+
 matplotlib.use('Agg')
 
 class CNNModel(nn.Module):
@@ -154,6 +165,53 @@ def plot_strategy_performance(data: pd.DataFrame, strategy_results: Dict[str, An
     plt.savefig(os.path.join('data', 'strategy_performance.png'))
     plt.close()
 
+def get_position(exchange: ccxt.Exchange) -> float:
+    """Get current position size. Positive for long, negative for short, 0 for no position."""
+    try:
+        positions = exchange.fetch_positions(['BTC/USDT'])
+        for position in positions:
+            if position['symbol'] == 'BTC/USDT':
+                size = float(position['contracts'] or 0)
+                side = 1 if position['side'] == 'long' else -1
+                return size * side
+        return 0.0
+    except Exception as e:
+        logging.error(f"Error fetching position: {e}")
+        if 'not authenticated' in str(e).lower():
+            raise ValueError("Authentication failed. Please check your API keys.")
+        return 0.0
+
+def execute_trade(exchange: ccxt.Exchange, side: str, amount: float):
+    """Execute a trade on Binance Futures"""
+    try:
+        # Close any existing positions first
+        current_position = get_position(exchange)
+        if current_position != 0:
+            close_side = 'sell' if current_position > 0 else 'buy'
+            exchange.create_market_order(
+                symbol='BTC/USDT',
+                side=close_side,
+                amount=abs(current_position),
+                params={'type': 'future', 'reduceOnly': True}
+            )
+            logging.info(f"Closed existing {-current_position} position")
+        
+        # Open new position
+        exchange.create_market_order(
+            symbol='BTC/USDT',
+            side=side,
+            amount=amount,
+            params={'type': 'future'}
+        )
+        logging.info(f"Opened new {side} position of size {amount}")
+    except Exception as e:
+        logging.error(f"Error executing {side} trade: {e}")
+        if 'insufficient balance' in str(e).lower():
+            logging.error("Insufficient balance to execute trade")
+        elif 'not authenticated' in str(e).lower():
+            raise ValueError("Authentication failed. Please check your API keys.")
+        raise
+
 def save_model(model: nn.Module, metadata: Dict[str, Any], filepath: str):
     """Save model state and metadata to file"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -163,17 +221,11 @@ def save_model(model: nn.Module, metadata: Dict[str, Any], filepath: str):
     }
     torch.save(state, filepath)
 
-def main():
-    # Initialize components with specific configuration
-    data_provider = DataProvider(
-        tickers=['BTC/USDT'],
-        resolution=DataResolution.HOUR_01,
-        period=DataPeriod.YEAR_01,
-        skip_dashboard=True  # Skip dashboard creation to avoid potential errors
-    )
-    features_generator = FeaturesGenerator()
+def run_backtest(data_provider: DataProvider, features_generator: FeaturesGenerator):
+    """Run backtest mode: train model and evaluate performance"""
+    print("Running backtest mode...")
     
-    # Try to load existing data first
+    # Load and prepare data
     print("Loading data...")
     data_provider.data_load()
     
@@ -184,19 +236,137 @@ def main():
     if not data_provider.data or 'BTC/USDT' not in data_provider.data:
         raise RuntimeError("Failed to load data. Please check your internet connection and API access.")
     
-    # Get processed data for BTC/USDT
     data = data_provider.data['BTC/USDT']
-    
-    # Ensure column names are correct
     data.columns = [col.capitalize() for col in data.columns]
     
+    # Train and evaluate model
+    model, results = train_and_evaluate(data, features_generator)
+    
+    # Save model and results
+    save_results(model, results, data)
+    
+    return model, results
+
+def run_live_trading(model_path: str, data_provider: DataProvider, features_generator: FeaturesGenerator):
+    """Run live trading mode using saved model"""
+    print("Running live trading mode...")
+    
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join('data', 'trading.log')),
+            logging.StreamHandler()
+        ]
+    )
+    
+    # Load model
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"No model found at {model_path}. Run backtest mode first.")
+    
+    state = torch.load(model_path, weights_only=False)
+    metadata = state['metadata']
+    
+    model = CNNModel(
+        input_channels=metadata['input_channels'],
+        sequence_length=metadata['sequence_length']
+    )
+    model.load_state_dict(state['model_state_dict'])
+    model.eval()
+    
+    # Initialize exchange connection
+    api_key = os.getenv('BINANCE_API_KEY')
+    api_secret = os.getenv('BINANCE_API_SECRET')
+    
+    if not api_key or not api_secret:
+        raise ValueError("Please set BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
+    
+    # Initialize exchange with testnet URLs
+    exchange = ccxt.binance({
+        'apiKey': api_key,
+        'secret': api_secret,
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'future',
+            'adjustForTimeDifference': True,
+            'test': True  # Use test network
+        },
+        'urls': {
+            'api': {
+                'public': 'https://testnet.binancefuture.com/fapi/v1',
+                'private': 'https://testnet.binancefuture.com/fapi/v1',
+            },
+            'test': {
+                'public': 'https://testnet.binancefuture.com/fapi/v1',
+                'private': 'https://testnet.binancefuture.com/fapi/v1',
+            }
+        }
+    })
+    
+    # Test connection and account access
+    try:
+        exchange.set_sandbox_mode(True)
+        balance = exchange.fetch_balance()
+        logging.info(f"Successfully connected to Binance Futures testnet")
+        logging.info(f"Initial balance: {balance['USDT']['free']} USDT")
+    except Exception as e:
+        logging.error(f"Failed to connect to Binance Futures testnet: {e}")
+        logging.error("Please ensure you're using testnet API keys from https://testnet.binancefuture.com/")
+        raise
+    
+    # Start trading loop
+    strategy = TradingStrategy(
+        model=model,
+        sequence_length=metadata['sequence_length'],
+        threshold=metadata['threshold']
+    )
+    
+    while True:
+        try:
+            # Get latest data
+            data_provider.data_request()
+            data = data_provider.data['BTC/USDT']
+            data.columns = [col.capitalize() for col in data.columns]
+            
+            # Generate features
+            features_df, _ = features_generator.prepare_features(data)
+            features = torch.FloatTensor(features_df.values[-metadata['sequence_length']:]).unsqueeze(0).transpose(1, 2)
+            
+            # Generate trading signal
+            signal = strategy.generate_signals(features)[0]
+            
+            # Execute trade
+            current_position = get_position(exchange)
+            if signal == 1 and current_position <= 0:
+                execute_trade(exchange, 'buy', 0.01)
+                logging.info("Opened LONG position")
+            elif signal == 0 and current_position >= 0:
+                execute_trade(exchange, 'sell', 0.01)
+                logging.info("Opened SHORT position")
+            
+            # Log status
+            balance = exchange.fetch_balance()
+            total_balance = balance['total']['USDT']
+            logging.info(f"Balance: {total_balance:.2f} USDT, Signal: {signal}, Position: {current_position}")
+            
+            time.sleep(3600)  # Wait 1 hour
+            
+        except KeyboardInterrupt:
+            logging.info("Stopping live trading...")
+            break
+        except Exception as e:
+            logging.error(f"Error in trading loop: {e}")
+            time.sleep(60)
+
+def train_and_evaluate(data: pd.DataFrame, features_generator: FeaturesGenerator) -> tuple:
+    """Train model and evaluate performance"""
     # Generate features
     features_df, feature_names = features_generator.prepare_features(data)
     
     # Create labels based on future returns
-    future_returns = data['Close'].pct_change(periods=3).shift(-3).iloc[:-3].values  # 3-period future returns
+    future_returns = data['Close'].pct_change(periods=3).shift(-3).iloc[:-3].values
     labels = (future_returns > 0).astype(float)
-    # Add label smoothing for small moves
     labels = np.where(np.abs(future_returns) > 0.01, labels, 0.5)
     labels = labels[len(labels)-len(features_df):]
     
@@ -209,7 +379,7 @@ def main():
     sequence_length = 20
     n_features = X_train.shape[1]
     
-    # Prepare sequences for CNN
+    # Prepare sequences
     X_train_seq = []
     X_test_seq = []
     y_train_seq = []
@@ -228,24 +398,33 @@ def main():
     y_train = torch.FloatTensor(np.array(y_train_seq))
     y_test = torch.FloatTensor(np.array(y_test_seq))
     
-    # Initialize and train model with improved parameters
+    # Train model
     model = CNNModel(input_channels=n_features, sequence_length=sequence_length)
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
-    n_epochs = 100  # Increased epochs
-    batch_size = 64  # Increased batch size
     train_loader = DataLoader(
         TensorDataset(X_train, y_train.reshape(-1, 1)),
-        batch_size=batch_size,
+        batch_size=64,
         shuffle=True
     )
     
     print("Training CNN model...")
+    train_model(model, train_loader, criterion, optimizer)
+    
+    # Run backtest
+    strategy = TradingStrategy(model, sequence_length=sequence_length)
+    results = strategy.backtest(data.iloc[-len(X_test)-sequence_length:], X_test)
+    
+    return model, results
+
+def train_model(model: nn.Module, train_loader: DataLoader, criterion: nn.Module, optimizer: optim.Optimizer):
+    """Train the CNN model"""
+    n_epochs = 100
     best_loss = float('inf')
     patience_counter = 0
     patience = 20  # Early stopping patience
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     for epoch in range(n_epochs):
         model.train()
@@ -284,26 +463,17 @@ def main():
         if patience_counter >= patience:
             print("Early stopping triggered")
             break
-    
-    # Initialize and run strategy
-    strategy = TradingStrategy(model, sequence_length=sequence_length)
-    results = strategy.backtest(data.iloc[-len(X_test)-sequence_length:], X_test)
-    
-    print(f"\nStrategy Performance:")
-    print(f"Final Balance: ${results['final_balance']:.2f}")
-    print(f"Return: {((results['final_balance'] / 100000 - 1) * 100):.2f}%")
-    print(f"Number of Trades: {len(results['trades'])}")
-    
-    # Save model and metadata
+
+def save_results(model: nn.Module, results: dict, data: pd.DataFrame):
+    """Save model, metadata, and performance plots"""
     metadata = {
-        'input_channels': n_features,
-        'sequence_length': sequence_length,
-        'threshold': strategy.threshold,
-        'feature_names': feature_names,
+        'input_channels': model.input_channels,
+        'sequence_length': model.sequence_length,
+        'threshold': 0.45,
         'training_date': pd.Timestamp.now().strftime('%Y-%m-%d'),
         'performance': {
             'final_balance': results['final_balance'],
-            'return': ((results['final_balance'] / 100000 - 1) * 100),
+            'return': (results['final_balance'] / 100000 - 1) * 100,
             'n_trades': len(results['trades'])
         }
     }
@@ -312,8 +482,39 @@ def main():
     save_model(model, metadata, model_path)
     print(f"\nModel saved to {model_path}")
     
-    # Plot results
-    plot_strategy_performance(data.iloc[-len(X_test)-sequence_length:], results)
+    # Save performance plot
+    plot_strategy_performance(data, results)
+
+def main():
+    # Initialize components
+    data_provider = DataProvider(
+        tickers=['BTC/USDT'],
+        resolution=DataResolution.HOUR_01,
+        period=DataPeriod.YEAR_01,
+        skip_dashboard=True
+    )
+    features_generator = FeaturesGenerator()
+    
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='CNN Trading Strategy')
+    parser.add_argument('mode', choices=['backtest', 'live'],
+                        help='Run mode: backtest (train model) or live (trade)')
+    args = parser.parse_args()
+    
+    if args.mode == 'backtest':
+        run_backtest(data_provider, features_generator)
+    else:
+        model_path = os.path.join('models', 'cnn_trader.pth')
+        run_live_trading(model_path, data_provider, features_generator)
+    
+
 
 if __name__ == '__main__':
+    # Remove hardcoded API keys - they should be set in environment variables
+    if 'BINANCE_API_KEY' not in os.environ or 'BINANCE_API_SECRET' not in os.environ:
+        print("Please set BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
+        print("Get your testnet API keys from https://testnet.binancefuture.com/")
+        sys.exit(1)
+        
     main()
