@@ -1,9 +1,11 @@
 class Position:
     def __init__(self, dict_: dict):
+        if dict_ is None:
+            dict_ = {}
         self.info = dict_.get('info', None)
         self.id = dict_.get('id', None)
         self.symbol = dict_.get('symbol', None)
-        self.contracts = dict_.get('contracts', None)
+        self.contracts = dict_.get('contracts', 0)
         self.contractSize = dict_.get('contractSize', None)
         self.unrealizedPnl = dict_.get('unrealizedPnl', None)
         self.leverage = dict_.get('leverage', None)
@@ -21,7 +23,8 @@ class Position:
         self.datetime = dict_.get('datetime', None)
         self.marginMode = dict_.get('marginMode', None)
         self.marginType = dict_.get('marginType', None)
-        self.side = 1 if dict_.get('side', None) == 'long' else -1
+        side = dict_.get('side', 0)
+        self.side = 1 if side == 'long' else -1 if side == 'short' else 0
         self.hedged = dict_.get('hedged', None)
         self.percentage = dict_.get('percentage', None)
         self.stopLossPrice = dict_.get('stopLossPrice', None)

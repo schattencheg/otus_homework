@@ -23,4 +23,4 @@ ENV PYTHONUNBUFFERED=1
 ENV MATPLOTLIB_BACKEND=Agg
 
 # Default command (can be overridden)
-CMD ["python", "run_me_hw7.py"]
+CMD ["python", "run_me_hw7.py", "live"]

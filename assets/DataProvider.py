@@ -608,7 +608,7 @@ class DataProvider:
                 if new_data is not None and not new_data.empty:
                     #print(f'Received {len(new_data)} records')
                     self._has_new_data = True
-                    logging.info(f'Received data for {new_data.index[-1]}')
+                    logging.info(f'{ticker} Received data for {new_data.index[-1]}')
                     existing_data = self.data[ticker] if ticker in self.data else None
                     data = self.data_append(existing_data, new_data)
                     self.data_processed[ticker] = self.process_new_data(ticker, data)

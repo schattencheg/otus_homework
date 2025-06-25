@@ -1,27 +1,24 @@
-import logging
 import os
-import sys
 import time
-from datetime import datetime
-from typing import Any, Dict, List, Tuple
-
+from typing import Any, Dict
 import ccxt
+import logging
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from assets.Position import Position
-from assets.Order import Order
-from assets.DataProvider import DataPeriod, DataProvider, DataResolution
+
+from assets.DataProvider import DataProvider
 from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataPeriod, DataResolution
+from assets.Position import Position
+from assets.Order import Order
+
 pd.options.mode.chained_assignment = None  # default='warn'
 
 #os.environ['BINANCE_API_KEY'] = 'QvAaxE0hMuqjKSzGxE625DudfJ3F0N6cdYqqePUiAu1lm5wAwyKTOE3b285AM0VQ'
@@ -70,8 +67,7 @@ class CNNModel(nn.Module):
         
         x = x.view(-1, self.flatten_size)
         x = self.dropout(self.relu(self.fc1(x)))
-        x = self.sigmoid(self.fc2(x))
-        
+        x = self.sigmoid(self.fc2(x))        
         return x
 
 class TradingStrategy:
@@ -166,6 +162,24 @@ def plot_strategy_performance(data: pd.DataFrame, strategy_results: Dict[str, An
     plt.savefig(os.path.join('data', 'strategy_performance.png'))
     plt.close()
 
+def flat_position(exchange: ccxt.Exchange):
+    current_position: Position = Position(get_position(exchange))
+    current_position_size = current_position.contracts * current_position.side
+    if current_position_size != 0:
+        close_side = 'sell' if current_position_size > 0 else 'buy'
+        exchange.create_market_order(
+            symbol='BTC/USDT',
+            side=close_side,
+            amount=abs(current_position_size),
+            params={'type': 'future', 'reduceOnly': True}
+        )
+        logging.info(f"Closed existing {-current_position_size} position")
+    # Check if position is closed
+    current_position = Position(get_position(exchange))
+    if current_position.contracts == 0:
+        logging.info("Current position is FLAT")
+
+
 def get_position(exchange: ccxt.Exchange) -> float:
     """Get current position size. Positive for long, negative for short, 0 for no position."""
     try:
@@ -187,16 +201,17 @@ def execute_trade(exchange: ccxt.Exchange, side: str, amount: float):
     """Execute a trade on Binance Futures"""
     try:
         # Close any existing positions first
-        current_position = get_position(exchange)
-        if current_position != 0:
-            close_side = 'sell' if current_position > 0 else 'buy'
+        current_position = Position(get_position(exchange))
+        current_position_size = current_position.contracts * current_position.side
+        if current_position_size != 0:
+            close_side = 'sell' if current_position_size > 0 else 'buy'
             exchange.create_market_order(
                 symbol='BTC/USDT',
                 side=close_side,
-                amount=abs(current_position),
+                amount=abs(current_position_size),
                 params={'type': 'future', 'reduceOnly': True}
             )
-            logging.info(f"Closed existing {-current_position} position")
+            logging.info(f"Closed existing {-current_position_size} position")
         
         # Open new position
         order_dict = exchange.create_market_order(
@@ -268,6 +283,7 @@ def run_live_trading(model_path: str, data_provider: DataProvider, features_gene
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"No model found at {model_path}. Run backtest mode first.")
     
+    logging.info(f"Loading model from {model_path}")
     state = torch.load(model_path, weights_only=False)
     metadata = state['metadata']
     
@@ -277,7 +293,8 @@ def run_live_trading(model_path: str, data_provider: DataProvider, features_gene
     )
     model.load_state_dict(state['model_state_dict'])
     model.eval()
-    
+    logging.info(f"Model loaded successfully")
+
     # Initialize exchange connection
     api_key = os.getenv('BINANCE_API_KEY')
     api_secret = os.getenv('BINANCE_API_SECRET')
@@ -309,6 +326,7 @@ def run_live_trading(model_path: str, data_provider: DataProvider, features_gene
     
     # Test connection and account access
     try:
+        logging.info('Switching to sandbox mode')
         exchange.set_sandbox_mode(True)
         balance = exchange.fetch_balance()
         logging.info(f"Successfully connected to Binance Futures testnet")
@@ -324,6 +342,8 @@ def run_live_trading(model_path: str, data_provider: DataProvider, features_gene
         sequence_length=metadata['sequence_length'],
         threshold=metadata['threshold']
     )
+
+    flat_position(exchange)
     
     while True:
         try:
