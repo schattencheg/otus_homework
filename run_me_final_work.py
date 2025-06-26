@@ -170,11 +170,38 @@ class TradingStrategy:
             print(f"Momentum labels: {momentum_labels.shape}")
             print(f"Sequence tensor: {sequence_tensor.shape}")
             
-            # Train momentum predictor
+            # Split data for validation
+            split_idx = int(len(features) * 0.8)
+            
+            # Train momentum predictor with cross-validation
+            print("\nTraining Momentum Predictor...")
+            from sklearn.model_selection import cross_val_score
+            cv_scores = cross_val_score(self.momentum_predictor.model, features, momentum_labels, 
+                                       cv=5, scoring='neg_mean_squared_error')
+            print(f"Cross-validation MSE: {-cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+            
+            # Final fit on full data
             self.momentum_predictor.fit(features, momentum_labels)
             
-            # Train regime classifier
+            # Train regime classifier with silhouette analysis
+            print("\nTraining Market Regime Classifier...")
+            best_score = -1
+            best_n_clusters = 3
+            
+            for n_clusters in range(2, 6):
+                classifier = MarketRegimeClassifier(n_clusters=n_clusters)
+                classifier.fit(features)
+                labels = classifier.predict(features)
+                score = silhouette_score(features, labels)
+                print(f"Silhouette score with {n_clusters} clusters: {score:.4f}")
+                
+                if score > best_score:
+                    best_score = score
+                    best_n_clusters = n_clusters
+            
+            self.regime_classifier = MarketRegimeClassifier(n_clusters=best_n_clusters)
             self.regime_classifier.fit(features)
+            print(f"Selected {best_n_clusters} clusters with score {best_score:.4f}")
             
             # Initialize and train CNN
             self.cnn_predictor = CNNTradePredictor(
@@ -187,37 +214,120 @@ class TradingStrategy:
             y_cnn = y_cnn[:len(sequence_tensor)]  # Align with sequence data
             y_cnn = torch.LongTensor(y_cnn)
             
-            # Train CNN
+            # Split data for CNN
+            train_size = int(0.8 * len(sequence_tensor))
+            train_sequence = sequence_tensor[:train_size]
+            train_labels = y_cnn[:train_size]
+            val_sequence = sequence_tensor[train_size:]
+            val_labels = y_cnn[train_size:]
+            
+            # Create data loaders
+            batch_size = 32
+            train_dataset = TensorDataset(train_sequence, train_labels)
+            val_dataset = TensorDataset(val_sequence, val_labels)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size)
+            
+            # Train CNN with early stopping
+            print("\nTraining CNN...")
             self.cnn_predictor.train()
             criterion = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(self.cnn_predictor.parameters())
+            optimizer = optim.Adam(self.cnn_predictor.parameters(), lr=0.001)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
             
-            n_epochs = 50
-            batch_size = 32
-            dataset = TensorDataset(sequence_tensor, y_cnn)
-            train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            best_val_loss = float('inf')
+            patience = 10
+            patience_counter = 0
+            best_state = None
             
-            print("\nTraining CNN...")
+            n_epochs = 100
             for epoch in range(n_epochs):
-                total_loss = 0
+                # Training phase
+                self.cnn_predictor.train()
+                train_loss = 0
+                train_correct = 0
+                train_total = 0
+                
                 for batch_X, batch_y in train_loader:
                     optimizer.zero_grad()
                     outputs = self.cnn_predictor(batch_X)
                     loss = criterion(outputs, batch_y)
                     loss.backward()
                     optimizer.step()
-                    total_loss += loss.item()
+                    
+                    train_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    train_total += batch_y.size(0)
+                    train_correct += predicted.eq(batch_y).sum().item()
+                
+                # Validation phase
+                self.cnn_predictor.eval()
+                val_loss = 0
+                val_correct = 0
+                val_total = 0
+                
+                with torch.no_grad():
+                    for batch_X, batch_y in val_loader:
+                        outputs = self.cnn_predictor(batch_X)
+                        loss = criterion(outputs, batch_y)
+                        val_loss += loss.item()
+                        
+                        _, predicted = outputs.max(1)
+                        val_total += batch_y.size(0)
+                        val_correct += predicted.eq(batch_y).sum().item()
+                
+                train_loss = train_loss / len(train_loader)
+                val_loss = val_loss / len(val_loader)
+                train_acc = 100. * train_correct / train_total
+                val_acc = 100. * val_correct / val_total
+                
+                # Learning rate scheduling
+                scheduler.step(val_loss)
                 
                 if (epoch + 1) % 10 == 0:
-                    print(f"Epoch [{epoch+1}/{n_epochs}], Loss: {total_loss/len(train_loader):.4f}")
+                    print(f"Epoch [{epoch+1}/{n_epochs}]")
+                    print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+                    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+                
+                # Early stopping check
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = self.cnn_predictor.state_dict()
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= patience:
+                    print(f"Early stopping triggered at epoch {epoch+1}")
+                    break
+            
+            # Load best model
+            if best_state is not None:
+                self.cnn_predictor.load_state_dict(best_state)
             
             # Save models
             print("\nSaving models...")
             self.save_models()
             
+            # Final validation
+            self.cnn_predictor.eval()
+            with torch.no_grad():
+                final_val_correct = 0
+                final_val_total = 0
+                for batch_X, batch_y in val_loader:
+                    outputs = self.cnn_predictor(batch_X)
+                    _, predicted = outputs.max(1)
+                    final_val_total += batch_y.size(0)
+                    final_val_correct += predicted.eq(batch_y).sum().item()
+                
+                final_val_acc = 100. * final_val_correct / final_val_total
+            
             return {
                 'feature_importance': self.momentum_predictor.feature_importance,
-                'n_regimes': self.regime_classifier.n_clusters
+                'n_regimes': self.regime_classifier.n_clusters,
+                'momentum_cv_score': -cv_scores.mean(),
+                'regime_silhouette_score': best_score,
+                'cnn_val_accuracy': final_val_acc
             }
             
         except Exception as e:
@@ -400,25 +510,41 @@ def main():
     features_generator = FeaturesGenerator()
     
     # Load and process data
+    print("Loading and processing data...")
     data_provider.data_load()
     df = data_provider.data_processed['BTC/USDT']
     
     # Create and train strategy
+    print("\nInitializing and training strategy...")
     strategy = TradingStrategy()
     training_results = strategy.train(df, features_generator)
     
-    print("\nTop feature importance:")
+    print("\nModel Training Results:")
+    print("-" * 50)
+    print("Momentum Predictor:")
+    print(f"Mean Squared Error (CV): {training_results['momentum_cv_score']:.4f}")
+    print("\nTop 5 Important Features:")
     print(training_results['feature_importance'].head())
     
+    print("\nMarket Regime Classifier:")
+    print(f"Number of Regimes: {training_results['n_regimes']}")
+    print(f"Silhouette Score: {training_results['regime_silhouette_score']:.4f}")
+    
+    print("\nCNN Trade Predictor:")
+    print(f"Validation Accuracy: {training_results['cnn_val_accuracy']:.2f}%")
+    
     # Run backtest
+    print("\nRunning backtest...")
     results = strategy.backtest(df, features_generator)
     
-    print(f"\nBacktest Results:")
+    print("\nBacktest Results:")
+    print("-" * 50)
     print(f"Final Balance: ${results['final_balance']:,.2f}")
     print(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
     print(f"Max Drawdown: {results['max_drawdown']:.2%}")
     print(f"Win Rate: {results['win_rate']:.2%}")
     print(f"Number of Trades: {results['n_trades']}")
+    print(f"Average Momentum: {results['avg_momentum']:.4f}")
     
     # Plot results
     plot_results(results)
