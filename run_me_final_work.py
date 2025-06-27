@@ -7,9 +7,12 @@ import torch.optim as optim
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from sklearn.model_selection import cross_val_score
 from sklearn.ensemble import GradientBoostingRegressor
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from typing import Dict, Any, List, Tuple
 import joblib
 
@@ -92,12 +95,14 @@ class CNNTradePredictor(nn.Module):
         return x
 
 class MarketRegimeClassifier:
-    """Identifies market regimes using K-Means clustering"""
+    """Identifies market regimes using K-Means clustering with smoothing"""
     
-    def __init__(self, n_clusters=3):
+    def __init__(self, n_clusters=3, smoothing_window=5):
         self.n_clusters = n_clusters
         self.kmeans = KMeans(n_clusters=n_clusters, random_state=42)
         self.scaler = MinMaxScaler()
+        self.smoothing_window = smoothing_window
+        self.last_regimes = []
         
     def fit(self, X: np.ndarray) -> None:
         X_scaled = self.scaler.fit_transform(X)
@@ -105,7 +110,29 @@ class MarketRegimeClassifier:
         
     def predict(self, X: np.ndarray) -> np.ndarray:
         X_scaled = self.scaler.transform(X)
-        return self.kmeans.predict(X_scaled)
+        raw_predictions = self.kmeans.predict(X_scaled)
+        
+        # Apply smoothing to regime predictions
+        smoothed_predictions = np.copy(raw_predictions)
+        for i in range(len(raw_predictions)):
+            # Get recent regime history
+            start_idx = max(0, i - self.smoothing_window)
+            recent_regimes = raw_predictions[start_idx:i+1]
+            
+            # Only change regime if it's persistent in recent window
+            if len(recent_regimes) > 0:
+                current_regime = recent_regimes[-1]
+                regime_counts = np.bincount(recent_regimes)
+                most_common_regime = np.argmax(regime_counts)
+                
+                # Change regime only if the new regime is dominant
+                if regime_counts[most_common_regime] >= len(recent_regimes) * 0.7:
+                    smoothed_predictions[i] = most_common_regime
+                elif i > 0:
+                    # Maintain previous regime if no clear dominance
+                    smoothed_predictions[i] = smoothed_predictions[i-1]
+        
+        return smoothed_predictions
     
     def save(self, path: str) -> None:
         joblib.dump({
@@ -155,9 +182,11 @@ class TradingStrategy:
         
         if not sequence_data:
             raise ValueError("Not enough data points for sequence generation")
-            
-        sequence_tensor = torch.FloatTensor(np.array(sequence_data))
-        sequence_tensor = sequence_tensor.permute(0, 2, 1)  # (batch, channels, seq_len)
+        
+        # Convert list of arrays to a single numpy array first
+        sequence_data = np.array(sequence_data)
+        sequence_tensor = torch.FloatTensor(sequence_data)
+        sequence_tensor = sequence_tensor.transpose(1, 2)  # (batch, channels, seq_len)
         
         return features.values, momentum_labels.values, sequence_tensor
     
@@ -175,23 +204,23 @@ class TradingStrategy:
             
             # Train momentum predictor with cross-validation
             print("\nTraining Momentum Predictor...")
-            from sklearn.model_selection import cross_val_score
             cv_scores = cross_val_score(self.momentum_predictor.model, features, momentum_labels, 
                                        cv=5, scoring='neg_mean_squared_error')
-            print(f"Cross-validation MSE: {-cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+            cv_mse = -cv_scores.mean()
+            cv_std = cv_scores.std()
+            print(f"Cross-validation MSE: {cv_mse:.4f} (+/- {cv_std:.4f})")
             
-            # Final fit on full data
             self.momentum_predictor.fit(features, momentum_labels)
             
-            # Train regime classifier with silhouette analysis
+            # Train regime classifier
             print("\nTraining Market Regime Classifier...")
+            best_n_clusters = 2
             best_score = -1
-            best_n_clusters = 3
             
             for n_clusters in range(2, 6):
-                classifier = MarketRegimeClassifier(n_clusters=n_clusters)
-                classifier.fit(features)
-                labels = classifier.predict(features)
+                self.regime_classifier = MarketRegimeClassifier(n_clusters=n_clusters)
+                self.regime_classifier.fit(features)
+                labels = self.regime_classifier.predict(features)
                 score = silhouette_score(features, labels)
                 print(f"Silhouette score with {n_clusters} clusters: {score:.4f}")
                 
@@ -199,22 +228,20 @@ class TradingStrategy:
                     best_score = score
                     best_n_clusters = n_clusters
             
-            self.regime_classifier = MarketRegimeClassifier(n_clusters=best_n_clusters)
-            self.regime_classifier.fit(features)
-            print(f"Selected {best_n_clusters} clusters with score {best_score:.4f}")
+            print(f"\nSelected {best_n_clusters} clusters with score {best_score:.4f}")
             
-            # Initialize and train CNN
-            self.cnn_predictor = CNNTradePredictor(
-                input_channels=features.shape[1],
-                sequence_length=self.sequence_length
-            )
-            
-            # Prepare CNN training data
-            y_cnn = np.where(momentum_labels > 0, 1, 0)  # Binary labels
-            y_cnn = y_cnn[:len(sequence_tensor)]  # Align with sequence data
-            y_cnn = torch.LongTensor(y_cnn)
+            # Train CNN
+            print("\nTraining CNN...")
+            # Initialize model
+            self.cnn_predictor = CNNTradePredictor(features.shape[1], self.sequence_length)
             
             # Split data for CNN
+            # Prepare binary labels for the entire sequence first
+            y_cnn = np.where(momentum_labels > 0, 1, 0)  # Binary labels
+            y_cnn = y_cnn[self.sequence_length:]  # Align with sequence data
+            y_cnn = torch.LongTensor(y_cnn)
+            
+            # Split data
             train_size = int(0.8 * len(sequence_tensor))
             train_sequence = sequence_tensor[:train_size]
             train_labels = y_cnn[:train_size]
@@ -228,21 +255,20 @@ class TradingStrategy:
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=batch_size)
             
-            # Train CNN with early stopping
-            print("\nTraining CNN...")
-            self.cnn_predictor.train()
+            # Training setup
             criterion = nn.CrossEntropyLoss()
             optimizer = optim.Adam(self.cnn_predictor.parameters(), lr=0.001)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
+                                                           factor=0.5, patience=5)
             
+            # Training loop
+            epochs = 100
             best_val_loss = float('inf')
+            best_state = None
             patience = 10
             patience_counter = 0
-            best_state = None
             
-            n_epochs = 100
-            for epoch in range(n_epochs):
-                # Training phase
+            for epoch in range(epochs):
                 self.cnn_predictor.train()
                 train_loss = 0
                 train_correct = 0
@@ -260,7 +286,7 @@ class TradingStrategy:
                     train_total += batch_y.size(0)
                     train_correct += predicted.eq(batch_y).sum().item()
                 
-                # Validation phase
+                # Validation
                 self.cnn_predictor.eval()
                 val_loss = 0
                 val_correct = 0
@@ -281,15 +307,13 @@ class TradingStrategy:
                 train_acc = 100. * train_correct / train_total
                 val_acc = 100. * val_correct / val_total
                 
-                # Learning rate scheduling
-                scheduler.step(val_loss)
-                
+                # Print progress
                 if (epoch + 1) % 10 == 0:
-                    print(f"Epoch [{epoch+1}/{n_epochs}]")
+                    print(f"Epoch [{epoch+1}/{epochs}]")
                     print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-                    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+                    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%    ")
                 
-                # Early stopping check
+                # Early stopping
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_state = self.cnn_predictor.state_dict()
@@ -300,6 +324,8 @@ class TradingStrategy:
                 if patience_counter >= patience:
                     print(f"Early stopping triggered at epoch {epoch+1}")
                     break
+                
+                scheduler.step(val_loss)
             
             # Load best model
             if best_state is not None:
@@ -309,25 +335,13 @@ class TradingStrategy:
             print("\nSaving models...")
             self.save_models()
             
-            # Final validation
-            self.cnn_predictor.eval()
-            with torch.no_grad():
-                final_val_correct = 0
-                final_val_total = 0
-                for batch_X, batch_y in val_loader:
-                    outputs = self.cnn_predictor(batch_X)
-                    _, predicted = outputs.max(1)
-                    final_val_total += batch_y.size(0)
-                    final_val_correct += predicted.eq(batch_y).sum().item()
-                
-                final_val_acc = 100. * final_val_correct / final_val_total
-            
+            # Return training results
             return {
+                'momentum_cv_score': cv_mse,
                 'feature_importance': self.momentum_predictor.feature_importance,
-                'n_regimes': self.regime_classifier.n_clusters,
-                'momentum_cv_score': -cv_scores.mean(),
+                'n_regimes': best_n_clusters,
                 'regime_silhouette_score': best_score,
-                'cnn_val_accuracy': final_val_acc
+                'cnn_val_accuracy': val_acc
             }
             
         except Exception as e:
@@ -344,75 +358,198 @@ class TradingStrategy:
         confidences = 1 - (distances[np.arange(len(regime_labels)), regime_labels] / np.max(distances, axis=1))
         return confidences
         
-    def calculate_trend(self, prices: pd.Series, short_window: int = 20, long_window: int = 50) -> pd.Series:
-        """Calculate trend direction using EMA crossover"""
-        short_ema = prices.ewm(span=short_window, adjust=False).mean()
-        long_ema = prices.ewm(span=long_window, adjust=False).mean()
-        return (short_ema > long_ema).astype(int) * 2 - 1  # Returns 1 for uptrend, -1 for downtrend
+    def calculate_trend(self, prices: pd.Series, window: int = 50) -> pd.Series:
+        """Calculate trend using exponential moving averages with longer window"""
+        short_ema = prices.ewm(span=window, adjust=False).mean()
+        long_ema = prices.ewm(span=window*2, adjust=False).mean()
+        
+        # Calculate trend strength
+        trend_strength = (short_ema - long_ema) / long_ema
+        
+        # Return trend direction weighted by strength
+        return pd.Series(np.sign(trend_strength) * np.minimum(abs(trend_strength) * 100, 1), 
+                        index=prices.index)
     
-    def generate_signals(self, data: pd.DataFrame, features_generator: FeaturesGenerator) \
-            -> Tuple[np.ndarray, np.ndarray, float]:
-        features, _, sequence_tensor = self.prepare_data(data, features_generator)
+    def generate_signals(self, data: pd.DataFrame, features_generator: FeaturesGenerator) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Generate trading signals using the ensemble of models"""
+        features, _ = features_generator.prepare_features(data)
+        
+        # Align data
+        common_index = features.index.intersection(data.index)
+        features = features.loc[common_index]
+        data = data.loc[common_index]
+        
+        # Convert features to numpy array for predictions
+        features_array = features.values
+        
+        # Prepare sequence data for CNN
+        sequence_data = []
+        for i in range(len(features) - self.sequence_length):
+            sequence = features.iloc[i:i+self.sequence_length].values
+            sequence_data.append(sequence)
+        
+        if not sequence_data:
+            raise ValueError("Not enough data points for sequence generation")
+        
+        sequence_data = np.array(sequence_data)
+        sequence_tensor = torch.FloatTensor(sequence_data)
+        sequence_tensor = sequence_tensor.transpose(1, 2)  # (batch, channels, seq_len)
         
         # Get predictions from each model
-        momentum_pred = self.momentum_predictor.predict(features)
-        regime = self.regime_classifier.predict(features)
-        regime_confidence = self.calculate_regime_confidence(features, regime)
+        momentum_pred = self.momentum_predictor.predict(features_array)
+        regime = self.regime_classifier.predict(features_array)
+        regime_confidence = self.calculate_regime_confidence(features_array, regime)
         
         with torch.no_grad():
             trade_pred = torch.softmax(self.cnn_predictor(sequence_tensor), dim=1)
         
         # Calculate volatility and trend
-        volatility = self.calculate_volatility(data['Returns'])
-        volatility = volatility.fillna(method='bfill')
-        trend = self.calculate_trend(data['Close'])
+        volatility = self.calculate_volatility(data['Returns'], window=20)
+        volatility = volatility.bfill()
+        trend = self.calculate_trend(data['Close'], window=50)
         
-        # Define risk parameters
+        # Calculate longer-term trend strength
+        sma_50 = data['Close'].rolling(window=50).mean()
+        sma_200 = data['Close'].rolling(window=200).mean()
+        trend_strength = ((sma_50 - sma_200) / sma_200).fillna(0)
+        
+        # Signal generation parameters
         max_position_size = 1.0
-        min_confidence = 0.3  # Reduced confidence requirement
-        max_volatility = 1.0  # Increased volatility cap
-        momentum_threshold = 0.005  # 0.5% minimum expected return
+        min_confidence = 0.25
+        max_volatility = 1.2
+        momentum_threshold = 0.003
         
-        # Combine signals
         signals = np.zeros(len(features))
         position_sizes = np.zeros(len(features))
+        
+        # Signal smoothing window
+        signal_window = 5
+        long_signals = np.zeros(signal_window)
+        short_signals = np.zeros(signal_window)
         
         for i in range(len(features)):
             # Skip if volatility is too high or regime confidence is too low
             if volatility.iloc[i] > max_volatility or regime_confidence[i] < min_confidence:
                 continue
             
-            # Skip low liquidity regimes
-            if regime[i] == 0:  # Assuming 0 is low liquidity regime
+            # Skip if in ranging regime and trend is weak
+            if regime[i] == 0 and abs(trend_strength.iloc[i]) < 0.01:
                 continue
             
-            # Calculate base position size inversely proportional to volatility
-            vol_factor = max(0, 1 - (volatility.iloc[i] / max_volatility))
-            conf_factor = regime_confidence[i]
+            # Calculate position size factors
+            vol_factor = max(0.2, 1 - (volatility.iloc[i] / max_volatility))
+            conf_factor = regime_confidence[i] * (1 + abs(trend_strength.iloc[i]))
             base_size = max_position_size * vol_factor * conf_factor
             
-            # Adjust position size based on momentum strength
-            momentum_strength = abs(momentum_pred[i])
-            if momentum_strength < momentum_threshold:
-                continue
-                
-            position_sizes[i] = base_size * (momentum_strength / momentum_threshold)
-            position_sizes[i] = min(position_sizes[i], max_position_size)  # Cap position size
+            # Scale position size by momentum strength
+            momentum_value = momentum_pred[i]
+            momentum_strength = abs(momentum_value)
             
-            # Generate trade signals with stricter criteria
+            if momentum_strength >= momentum_threshold:
+                position_sizes[i] = base_size * (momentum_strength / momentum_threshold)
+                position_sizes[i] = min(position_sizes[i], max_position_size)
+            
+            # Generate signals only after we have enough sequence data
             if i >= self.sequence_length:
                 pred_idx = i - self.sequence_length
                 long_prob = trade_pred[pred_idx, 1].item()
                 short_prob = trade_pred[pred_idx, 0].item()
                 
-                # Take trades with moderate conviction and trend consideration
-                if (long_prob > 0.55 and 
-                    momentum_pred[i] > momentum_threshold and 
-                    (trend[i] > 0 or momentum_pred[i] > momentum_threshold * 2)):
+                # Update signal windows
+                long_signals = np.roll(long_signals, -1)
+                short_signals = np.roll(short_signals, -1)
+                
+                # Check signal conditions
+                long_signal = (long_prob > 0.53 and 
+                             momentum_value > momentum_threshold and 
+                             trend.iloc[i] > 0)
+                short_signal = (short_prob > 0.53 and 
+                              momentum_value < -momentum_threshold and 
+                              trend.iloc[i] < 0)
+                
+                long_signals[-1] = 1 if long_signal else 0
+                short_signals[-1] = 1 if short_signal else 0
+                
+                # Generate final signals based on persistence
+                if np.sum(long_signals) >= signal_window * 0.6 and trend_strength.iloc[i] > 0:
                     signals[i] = 1
-                elif (short_prob > 0.55 and 
-                      momentum_pred[i] < -momentum_threshold and 
-                      (trend[i] < 0 or momentum_pred[i] < -momentum_threshold * 2)):
+                elif np.sum(short_signals) >= signal_window * 0.6 and trend_strength.iloc[i] < 0:
+                    signals[i] = -1
+        
+        return signals, position_sizes, np.mean(momentum_pred)
+        
+        # Calculate volatility and trend with longer windows
+        volatility = self.calculate_volatility(data['Returns'], window=20)  # Increased window
+        volatility = volatility.bfill()
+        trend = self.calculate_trend(data['Close'], short_window=20, long_window=50)  # Longer trend window
+        
+        # Calculate additional trend indicators
+        sma_50 = data['Close'].rolling(window=50).mean()
+        sma_200 = data['Close'].rolling(window=200).mean()
+        trend_strength = ((sma_50 - sma_200) / sma_200).fillna(0)
+        
+        # Define risk parameters with reduced sensitivity
+        max_position_size = 1.0
+        min_confidence = 0.25  # Lower confidence requirement
+        max_volatility = 1.2  # Higher volatility tolerance
+        momentum_threshold = 0.003  # Lower momentum threshold
+        
+        # Combine signals
+        signals = np.zeros(len(features))
+        position_sizes = np.zeros(len(features))
+        
+        # Track signal persistence
+        signal_window = 5
+        long_signals = np.zeros(signal_window)
+        short_signals = np.zeros(signal_window)
+        
+        for i in range(len(features)):
+            # Basic volatility and regime checks
+            if volatility.iloc[i] > max_volatility or regime_confidence[i] < min_confidence:
+                continue
+            
+            # More sophisticated regime analysis
+            if regime[i] == 0 and trend_strength.iloc[i] < 0.01:  # Low liquidity and weak trend
+                continue
+            
+            # Position sizing with trend consideration
+            vol_factor = max(0.2, 1 - (volatility.iloc[i] / max_volatility))  # Minimum 20% size
+            conf_factor = regime_confidence[i] * (1 + abs(trend_strength.iloc[i]))
+            base_size = max_position_size * vol_factor * conf_factor
+            
+            # Momentum analysis with trend alignment
+            momentum_value = momentum_pred.iloc[i]
+            momentum_strength = abs(momentum_value)
+            
+            if momentum_strength >= momentum_threshold:
+                position_sizes[i] = base_size * (momentum_strength / momentum_threshold)
+                position_sizes[i] = min(position_sizes[i], max_position_size)
+            
+            # Generate trade signals with trend following
+            if i >= self.sequence_length:
+                pred_idx = i - self.sequence_length
+                long_prob = trade_pred[pred_idx, 1].item()
+                short_prob = trade_pred[pred_idx, 0].item()
+                
+                # Update signal history
+                long_signals = np.roll(long_signals, -1)
+                short_signals = np.roll(short_signals, -1)
+                
+                # Calculate signal strength with trend alignment
+                long_signal = (long_prob > 0.53 and 
+                             momentum_value > momentum_threshold and 
+                             trend.iloc[i] > 0)
+                short_signal = (short_prob > 0.53 and 
+                              momentum_value < -momentum_threshold and 
+                              trend.iloc[i] < 0)
+                
+                long_signals[-1] = 1 if long_signal else 0
+                short_signals[-1] = 1 if short_signal else 0
+                
+                # Generate signals only on persistent conditions
+                if np.sum(long_signals) >= signal_window * 0.6 and trend_strength.iloc[i] > 0:
+                    signals[i] = 1
+                elif np.sum(short_signals) >= signal_window * 0.6 and trend_strength.iloc[i] < 0:
                     signals[i] = -1
         
         return signals, position_sizes, np.mean(momentum_pred)
@@ -440,160 +577,108 @@ class TradingStrategy:
             'annual_return': annual_return
         }
     
-    def backtest(self, data: pd.DataFrame, features_generator: FeaturesGenerator,
-                 initial_balance: float = 100000) -> Dict[str, Any]:
-        signals, position_sizes, avg_momentum = self.generate_signals(
-            data, features_generator)
-        
+    def backtest(self, data: pd.DataFrame, features_generator: FeaturesGenerator) -> Dict[str, Any]:
+        """Run backtest of the strategy"""
+        initial_balance = 10000
         balance = initial_balance
         position = 0
         entry_price = 0
         trades = []
-        equity_curve = [initial_balance]
+        equity_values = []  # Will store equity values aligned with data
+    
+        # Get signals and position sizes
+        signals, position_sizes, avg_momentum = self.generate_signals(data, features_generator)
         
-        # Risk management parameters
-        stop_loss_pct = 0.02  # Tighter stop loss
-        take_profit_pct = 0.04  # Maintain good risk/reward
-        trailing_stop_pct = 0.015  # Tighter trailing stop
-        max_drawdown_pct = 0.10  # Stricter drawdown control
+        # Calculate returns and volatility for Sharpe ratio
+        returns = []
         
-        # Track highest equity for trailing stop and drawdown
-        highest_equity = initial_balance
-        highest_price_since_entry = 0
-        lowest_price_since_entry = float('inf')
-        
+        # Run backtest
         for i in range(len(signals)):
-            price = data['Close'].iloc[i]
+            close = data['Close'].iloc[i]
             signal = signals[i]
-            size = position_sizes[i]
             
-            current_value = balance
+            # Update position P&L
             if position != 0:
-                unrealized_pnl = position * (price - entry_price)
-                current_value += unrealized_pnl
-                
-                # Update price extremes since entry
-                if position > 0:
-                    highest_price_since_entry = max(highest_price_since_entry, price)
-                    trailing_stop_price = highest_price_since_entry * (1 - trailing_stop_pct)
-                    should_stop = price < trailing_stop_price
-                else:  # Short position
-                    lowest_price_since_entry = min(lowest_price_since_entry, price)
-                    trailing_stop_price = lowest_price_since_entry * (1 + trailing_stop_pct)
-                    should_stop = price > trailing_stop_price
-                
-                # Check stop loss, take profit, and trailing stop
-                stop_loss_hit = abs((price - entry_price) / entry_price) > stop_loss_pct and \
-                               np.sign(price - entry_price) != np.sign(position)
-                take_profit_hit = abs((price - entry_price) / entry_price) > take_profit_pct and \
-                                 np.sign(price - entry_price) == np.sign(position)
-                
-                # Close position if any exit condition is met
-                if stop_loss_hit or take_profit_hit or should_stop:
-                    balance = current_value
-                    trades.append({
-                        'type': 'close',
-                        'price': price,
-                        'pnl': unrealized_pnl,
-                        'balance': balance,
-                        'direction': 'long' if position > 0 else 'short',
-                        'reason': 'stop_loss' if stop_loss_hit else \
-                                 'take_profit' if take_profit_hit else 'trailing_stop'
-                    })
-                    position = 0
-                    highest_price_since_entry = 0
-                    lowest_price_since_entry = float('inf')
+                unrealized_pnl = position * (close - entry_price)
+                current_value = balance + unrealized_pnl
+            else:
+                current_value = balance
             
-            # Check for regular signal-based position changes
-            if position != 0 and signal != np.sign(position):
-                pnl = position * (price - entry_price)
-                balance += pnl
-                trades.append({
-                    'type': 'close',
-                    'price': price,
-                    'pnl': pnl,
-                    'balance': balance,
-                    'direction': 'long' if position > 0 else 'short',
-                    'reason': 'signal'
-                })
-                position = 0
-                highest_price_since_entry = 0
-                lowest_price_since_entry = float('inf')
+            equity_values.append(current_value)
             
-            # Open new position if we don't have one and drawdown is acceptable
-            current_drawdown = 1 - current_value / highest_equity
-            if position == 0 and signal != 0 and current_drawdown < max_drawdown_pct:
-                position = signal * size
-                entry_price = price
-                highest_price_since_entry = price
-                lowest_price_since_entry = price
+            # Calculate return for this period
+            if len(equity_values) > 1:
+                period_return = (equity_values[-1] - equity_values[-2]) / equity_values[-2]
+                returns.append(period_return)
+            
+            if signal != 0 and position == 0:
+                # Open position
+                position = signal
+                entry_price = close
+                position_size = position_sizes[i]
                 trades.append({
                     'type': 'open',
                     'direction': 'long' if signal > 0 else 'short',
-                    'size': size,
-                    'price': price,
-                    'balance': balance
+                    'price': close,
+                    'size': position_size,
+                    'balance': balance,
+                    'time': data.index[i]
                 })
-            
-            # Update equity curve and highest equity
-            equity_curve.append(current_value)
-            highest_equity = max(highest_equity, current_value)
+            elif position != 0 and (signal == 0 or signal == -position):
+                # Close position
+                pnl = position * (close - entry_price)
+                balance += pnl
+                trades.append({
+                    'type': 'close',
+                    'price': close,
+                    'pnl': pnl,
+                    'balance': balance,
+                    'time': data.index[i]
+                })
+                position = 0
+                entry_price = 0
+        # Calculate strategy metrics
+        total_return = (balance - initial_balance) / initial_balance
+        annual_return = (1 + total_return) ** (252 / len(data)) - 1
         
-        # Close any remaining position at the end
-        if position != 0:
-            price = data['Close'].iloc[-1]
-            pnl = position * (price - entry_price)
-            balance += pnl
-            trades.append({
-                'type': 'close',
-                'price': price,
-                'pnl': pnl,
-                'balance': balance,
-                'direction': 'long' if position > 0 else 'short'
-            })
-            equity_curve.append(balance)
+        # Create equity curve series
+        equity_curve = pd.Series(equity_values, index=data.index[:len(equity_values)])
         
-        # Calculate metrics
-        returns = np.diff(equity_curve) / equity_curve[:-1]
-        sharpe_ratio = np.sqrt(252) * np.mean(returns) / np.std(returns) if len(returns) > 0 else 0
+        # Calculate Sharpe ratio
+        returns_array = np.array(returns)
+        if len(returns_array) > 0:
+            volatility = np.std(returns_array) * np.sqrt(252)
+            sharpe_ratio = annual_return / volatility if volatility != 0 else 0
+        else:
+            sharpe_ratio = 0
         
-        # Calculate max drawdown
-        peak = equity_curve[0]
-        max_drawdown = 0
-        for value in equity_curve[1:]:
-            if value > peak:
-                peak = value
-            drawdown = (peak - value) / peak
-            max_drawdown = max(max_drawdown, drawdown)
+        # Calculate maximum drawdown
+        rolling_max = equity_curve.expanding().max()
+        drawdowns = (equity_curve - rolling_max) / rolling_max
+        max_drawdown = abs(drawdowns.min())
         
         # Calculate win rate
         closed_trades = [t for t in trades if t['type'] == 'close']
         winning_trades = sum(1 for t in closed_trades if t['pnl'] > 0)
         win_rate = winning_trades / len(closed_trades) if closed_trades else 0
         
-        # Calculate strategy metrics
-        total_return = (balance - initial_balance) / initial_balance
-        annual_return = (1 + total_return) ** (252 / len(data)) - 1
-        
-        strategy_results = {
-            'strategy': 'ML Ensemble',
-            'final_balance': balance,
-            'equity_curve': equity_curve,
-            'trades': trades,
-            'sharpe_ratio': sharpe_ratio,
-            'max_drawdown': max_drawdown,
-            'win_rate': win_rate,
-            'n_trades': len(trades),
-            'avg_momentum': avg_momentum,
-            'total_return': total_return,
-            'annual_return': annual_return
-        }
-        
         # Calculate buy & hold results
         bh_results = self.calculate_buy_hold_returns(data, initial_balance)
         
+        # Return results
         return {
-            'strategy_results': strategy_results,
+            'strategy_results': {
+                'final_balance': balance,
+                'total_return': total_return,
+                'annual_return': annual_return,
+                'sharpe_ratio': sharpe_ratio,
+                'max_drawdown': max_drawdown,
+                'win_rate': win_rate,
+                'n_trades': len(trades),
+                'equity_curve': equity_curve,
+                'trades': trades,
+                'price_data': data[['Close']]
+            },
             'buy_hold_results': bh_results
         }
     
@@ -612,58 +697,220 @@ class TradingStrategy:
         self.cnn_predictor.load_state_dict(torch.load('models/cnn_predictor.pth'))
 
 def plot_results(results: Dict[str, Any]) -> None:
-    """Plot backtest results comparing strategy vs buy & hold"""
+    """Plot backtest results comparing strategy vs buy & hold using Plotly"""
     strategy_results = results['strategy_results']
     bh_results = results['buy_hold_results']
     
-    # Create subplots
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12))
+    # Create figure with three subplots
+    fig = make_subplots(
+        rows=3, cols=1,
+        subplot_titles=('Price Chart with Trades', 'Strategy Performance Comparison', 'Performance Metrics'),
+        vertical_spacing=0.1,
+        row_heights=[0.4, 0.3, 0.3]
+    )
+    
+    # Get price data and dates
+    price_data = strategy_results['price_data']
+    dates = price_data.index
+    
+    # Plot price chart
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=price_data['Close'],
+            name='Price',
+            line=dict(color='lightgray')
+        ),
+        row=1, col=1
+    )
     
     # Plot equity curves
-    ax1.plot(strategy_results['equity_curve'], label='ML Ensemble Strategy')
-    ax1.plot([strategy_results['equity_curve'][0]] + 
-             [bh_results['final_balance']] * (len(strategy_results['equity_curve'])-1),
-             label='Buy & Hold', linestyle='--')
-    ax1.set_title('Strategy Comparison')
-    ax1.set_xlabel('Time')
-    ax1.set_ylabel('Portfolio Value ($)')
-    ax1.grid(True)
-    ax1.legend()
+    equity_data = pd.DataFrame(strategy_results['equity_curve'])
+    equity_dates = equity_data.index
+    values = equity_data.values.flatten()
     
-    # Plot trade points
+    fig.add_trace(
+        go.Scatter(
+            x=equity_dates,
+            y=values,
+            name='ML Strategy',
+            line=dict(color='blue')
+        ),
+        row=2, col=1
+    )
+    
+    # Buy & Hold line
+    fig.add_trace(
+        go.Scatter(
+            x=[equity_dates[0], equity_dates[-1]],
+            y=[bh_results['final_balance']] * 2,
+            name='Buy & Hold',
+            line=dict(color='gray', dash='dash')
+        ),
+        row=2, col=1
+    )
+    
+    # Plot trade points on both price and equity charts
     trades = strategy_results['trades']
+    long_entries_price = []
+    short_entries_price = []
+    long_exits_price = []
+    short_exits_price = []
+    long_entries_equity = []
+    short_entries_equity = []
+    long_exits_equity = []
+    short_exits_equity = []
+    
+    # Create lookup for price data
+    price_lookup = price_data['Close'].to_dict()
+    
+    # Track last trade direction to match exits with entries
+    last_trade_direction = None
+    
     for trade in trades:
+        trade_time = pd.Timestamp(trade['time'])
+        if trade_time not in price_lookup:
+            continue
+            
         if trade['type'] == 'open':
-            color = 'g' if trade['direction'] == 'long' else 'r'
-            marker = '^' if trade['direction'] == 'long' else 'v'
-            ax1.scatter(trades.index(trade), trade['balance'], 
-                       color=color, marker=marker, s=100)
+            last_trade_direction = trade['direction']
+            if trade['direction'] == 'long':
+                long_entries_price.append((trade_time, price_lookup[trade_time]))
+                long_entries_equity.append((trade_time, trade['balance']))
+            else:
+                short_entries_price.append((trade_time, price_lookup[trade_time]))
+                short_entries_equity.append((trade_time, trade['balance']))
+        elif trade['type'] == 'close' and last_trade_direction:
+            if last_trade_direction == 'long':
+                long_exits_price.append((trade_time, price_lookup[trade_time]))
+                long_exits_equity.append((trade_time, trade['balance']))
+            else:
+                short_exits_price.append((trade_time, price_lookup[trade_time]))
+                short_exits_equity.append((trade_time, trade['balance']))
+            last_trade_direction = None
+    
+    # Plot trade points on price chart
+    if long_entries_price:
+        dates, prices = zip(*long_entries_price)
+        fig.add_trace(go.Scatter(
+            x=dates, y=prices,
+            mode='markers',
+            name='Long Entries',
+            marker=dict(symbol='triangle-up', size=10, color='green'),
+        ), row=1, col=1)
+    
+    if long_exits_price:
+        dates, prices = zip(*long_exits_price)
+        fig.add_trace(go.Scatter(
+            x=dates, y=prices,
+            mode='markers',
+            name='Long Exits',
+            marker=dict(symbol='x', size=10, color='lightgreen'),
+        ), row=1, col=1)
+    
+    if short_entries_price:
+        dates, prices = zip(*short_entries_price)
+        fig.add_trace(go.Scatter(
+            x=dates, y=prices,
+            mode='markers',
+            name='Short Entries',
+            marker=dict(symbol='triangle-down', size=10, color='red'),
+        ), row=1, col=1)
+    
+    if short_exits_price:
+        dates, prices = zip(*short_exits_price)
+        fig.add_trace(go.Scatter(
+            x=dates, y=prices,
+            mode='markers',
+            name='Short Exits',
+            marker=dict(symbol='x', size=10, color='pink'),
+        ), row=1, col=1)
+    
+    # Plot trade points on equity curve
+    if long_entries_equity:
+        dates, values = zip(*long_entries_equity)
+        fig.add_trace(go.Scatter(
+            x=dates, y=values,
+            mode='markers',
+            name='Long Entries',
+            marker=dict(symbol='triangle-up', size=10, color='green'),
+            showlegend=False
+        ), row=2, col=1)
+    
+    if long_exits_equity:
+        dates, values = zip(*long_exits_equity)
+        fig.add_trace(go.Scatter(
+            x=dates, y=values,
+            mode='markers',
+            name='Long Exits',
+            marker=dict(symbol='x', size=10, color='lightgreen'),
+            showlegend=False
+        ), row=2, col=1)
+    
+    if short_entries_equity:
+        dates, values = zip(*short_entries_equity)
+        fig.add_trace(go.Scatter(
+            x=dates, y=values,
+            mode='markers',
+            name='Short Entries',
+            marker=dict(symbol='triangle-down', size=10, color='red'),
+            showlegend=False
+        ), row=2, col=1)
+    
+    if short_exits_equity:
+        dates, values = zip(*short_exits_equity)
+        fig.add_trace(go.Scatter(
+            x=dates, y=values,
+            mode='markers',
+            name='Short Exits',
+            marker=dict(symbol='x', size=10, color='pink'),
+            showlegend=False
+        ), row=2, col=1)
     
     # Plot performance metrics comparison
     metrics = ['total_return', 'annual_return', 'sharpe_ratio', 'max_drawdown']
     labels = ['Total Return', 'Annual Return', 'Sharpe Ratio', 'Max Drawdown']
     
-    x = np.arange(len(metrics))
-    width = 0.35
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=[strategy_results[m] for m in metrics],
+            name='ML Strategy',
+            marker_color='blue'
+        ),
+        row=2, col=1
+    )
     
-    strategy_values = [strategy_results[m] for m in metrics]
-    bh_values = [bh_results[m] for m in metrics]
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=[bh_results[m] for m in metrics],
+            name='Buy & Hold',
+            marker_color='gray'
+        ),
+        row=3, col=1
+    )
     
-    ax2.bar(x - width/2, strategy_values, width, label='ML Ensemble Strategy')
-    ax2.bar(x + width/2, bh_values, width, label='Buy & Hold')
+    # Update layout
+    fig.update_layout(
+        height=1000,
+        showlegend=True,
+        title_text="Trading Strategy Results",
+        title_x=0.5,
+        barmode='group'
+    )
     
-    ax2.set_title('Performance Metrics Comparison')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(labels)
-    ax2.grid(True)
-    ax2.legend()
+    fig.update_xaxes(title_text="Time", row=1, col=1)
+    fig.update_xaxes(title_text="Time", row=2, col=1)
+    fig.update_xaxes(title_text="Metrics", row=3, col=1)
     
-    plt.tight_layout()
+    fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Portfolio Value ($)", row=2, col=1)
+    fig.update_yaxes(title_text="Value", row=3, col=1)
     
-    # Save plot
+    # Save interactive plot
     os.makedirs('data', exist_ok=True)
-    plt.savefig('data/strategy_results.png')
-    plt.close()
+    fig.write_html('data/strategy_results.html')
 
 def main():
     # Initialize components
@@ -722,7 +969,7 @@ def main():
     
     # Plot results
     plot_results(results)
-    print("\nResults plot saved to data/strategy_results.png")
+    print("\nInteractive results plot saved to data/strategy_results.html")
 
 if __name__ == '__main__':
     main()
