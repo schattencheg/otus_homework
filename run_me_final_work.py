@@ -148,9 +148,11 @@ class MarketRegimeClassifier:
 class TradingStrategy:
     """Main trading strategy combining multiple models"""
     
-    def __init__(self, sequence_length: int = 20, trailing_stop_pct: float = 0.03,
-                 max_loss_pct: float = 0.04, profit_take_pct: float = 0.06,
-                 min_holding_bars: int = 5):
+    def __init__(self, sequence_length=20, momentum_threshold=0.01,
+                 min_trend_strength=0.015, max_volatility=1.2,
+                 trailing_stop_pct=0.025, max_loss_pct=0.035,
+                 profit_take_pct=0.045, min_holding_bars=3,
+                 max_position_size=2.0):
         """Initialize strategy with sequence length and risk parameters
         
         Args:
@@ -165,10 +167,14 @@ class TradingStrategy:
         self.regime_classifier = MarketRegimeClassifier()
         
         self.sequence_length = sequence_length
+        self.momentum_threshold = momentum_threshold
+        self.min_trend_strength = min_trend_strength
+        self.max_volatility = max_volatility
         self.trailing_stop_pct = trailing_stop_pct
         self.max_loss_pct = max_loss_pct
         self.profit_take_pct = profit_take_pct
         self.min_holding_bars = min_holding_bars
+        self.max_position_size = max_position_size
         
         self.position_size = 1.0  # Base position size
         
@@ -369,56 +375,85 @@ class TradingStrategy:
         return returns.rolling(window=window).std() * np.sqrt(252)
     
     def calculate_trend(self, prices: pd.Series):
-        # Calculate advanced trend using multiple indicators
-        # EMAs for different timeframes
-        ema_fast = prices.ewm(span=10).mean()
-        ema_med = prices.ewm(span=30).mean()
-        ema_slow = prices.ewm(span=50).mean()
-        ema_very_slow = prices.ewm(span=100).mean()
+        """Enhanced trend detection using multiple technical indicators and timeframes"""
+        # Multiple timeframe EMAs
+        ema_spans = [10, 20, 50, 100, 200]  # Added more EMAs
+        emas = {span: prices.ewm(span=span, adjust=False).mean() for span in ema_spans}
         
-        # Rate of change with exponential weights
-        roc_weights = np.array([0.4, 0.3, 0.2, 0.1])  # Exponentially decreasing weights
-        roc_short = prices.pct_change(10)
-        roc_med = prices.pct_change(20)
-        roc_long = prices.pct_change(30)
-        roc_very_long = prices.pct_change(50)
+        # Calculate slopes of EMAs
+        ema_slopes = {}
+        for span in ema_spans:
+            ema = emas[span]
+            ema_slopes[span] = (ema - ema.shift(5)) / ema.shift(5)  # 5-period slope
         
-        # Weighted ROC score
-        roc_score = (roc_short * roc_weights[0] + 
-                    roc_med * roc_weights[1] + 
-                    roc_long * roc_weights[2] + 
-                    roc_very_long * roc_weights[3])
+        # Rate of change across multiple timeframes with adaptive weights
+        roc_periods = [10, 20, 50, 100]  # Added longer timeframes
+        roc_series = {period: prices.pct_change(period) for period in roc_periods}
         
-        # Combine signals with advanced weighting
+        # Volatility-adjusted ROC (higher weight in lower volatility)
+        volatility = prices.pct_change().rolling(20).std()
+        vol_adj_roc = {period: roc_series[period] / (volatility + 0.0001) for period in roc_periods}
+        
+        # Directional Movement Index (DMI)
+        high = prices.rolling(2).max()
+        low = prices.rolling(2).min()
+        pos_dm = high.diff().clip(lower=0)
+        neg_dm = (-low.diff()).clip(lower=0)
+        tr = pd.concat([high - low, abs(high - prices.shift()), abs(low - prices.shift())], axis=1).max(axis=1)
+        smoothing = 14
+        pos_di = 100 * pos_dm.rolling(smoothing).mean() / tr.rolling(smoothing).mean()
+        neg_di = 100 * neg_dm.rolling(smoothing).mean() / tr.rolling(smoothing).mean()
+        
+        # ADX for trend strength
+        dx = 100 * abs(pos_di - neg_di) / (pos_di + neg_di)
+        adx = dx.rolling(smoothing).mean()
+        
+        # Combine signals with dynamic weighting
         trend = pd.Series(0.0, index=prices.index)
         
-        # Strong trend signals (weight: 40%)
-        trend[(ema_fast > ema_med) & (ema_med > ema_slow) & (ema_slow > ema_very_slow)] += 0.4
-        trend[(ema_fast < ema_med) & (ema_med < ema_slow) & (ema_slow < ema_very_slow)] -= 0.4
+        # EMA alignment signals (40% total weight)
+        for i in range(len(ema_spans)-1):
+            # Check if EMAs are properly aligned for trend
+            if ema_spans[i] < ema_spans[i+1]:
+                trend[emas[ema_spans[i]] > emas[ema_spans[i+1]]] += 0.4 / (len(ema_spans)-1)
+                trend[emas[ema_spans[i]] < emas[ema_spans[i+1]]] -= 0.4 / (len(ema_spans)-1)
         
-        # Moderate trend signals (weight: 30%)
-        trend[(ema_fast > ema_med) & (ema_med > ema_slow)] += 0.3
-        trend[(ema_fast < ema_med) & (ema_med < ema_slow)] -= 0.3
+        # EMA slopes (20% weight)
+        for span, slope in ema_slopes.items():
+            weight = 0.2 / len(ema_slopes)
+            trend[slope > 0] += weight
+            trend[slope < 0] -= weight
         
-        # Weak trend signals (weight: 20%)
-        trend[(ema_fast > ema_med) | (ema_med > ema_slow)] += 0.2
-        trend[(ema_fast < ema_med) | (ema_med < ema_slow)] -= 0.2
+        # Volatility-adjusted ROC (20% weight)
+        for period, roc in vol_adj_roc.items():
+            weight = 0.2 / len(vol_adj_roc)
+            trend[roc > 0] += weight
+            trend[roc < 0] -= weight
         
-        # Add weighted ROC score (weight: 10%)
-        trend += roc_score * 0.1
+        # DMI and ADX (20% weight)
+        trend[pos_di > neg_di] += 0.1
+        trend[pos_di < neg_di] -= 0.1
         
-        # Normalize and classify trend
-        trend = trend / 0.5  # Normalize to roughly -2 to 2 range
+        # Increase trend conviction when ADX is high
+        adx_factor = (adx / 100).clip(0, 1)  # Normalize to 0-1
+        trend = trend * (1 + adx_factor)  # Amplify trend when ADX is high
         
-        # Non-linear transformation to emphasize strong trends
-        trend = np.sign(trend) * np.abs(trend) ** 1.5
+        # Normalize trend scores
+        trend = trend / trend.abs().rolling(100).mean()  # Adaptive normalization
         
-        # Final classification with strong bias towards neutral
-        trend[trend > 0.7] = 1  # Strong uptrend
-        trend[trend < -0.7] = -1  # Strong downtrend
-        trend[(trend >= -0.7) & (trend <= 0.7)] = 0  # Sideways/unclear trend
+        # Apply non-linear transformation to emphasize strong trends
+        trend = np.sign(trend) * np.abs(trend) ** 1.2
         
-        return trend.fillna(0).fillna(0)
+        # More sensitive trend classification
+        threshold = adx_factor.rolling(10).mean() * 0.4 + 0.25  # Lower and more responsive threshold
+        trend[trend > threshold] = 1  # Strong uptrend
+        trend[trend < -threshold] = -1  # Strong downtrend
+        # Partial trend signals for moderate trends
+        trend[(trend > threshold/2) & (trend <= threshold)] = 0.5  # Moderate uptrend
+        trend[(trend < -threshold/2) & (trend >= -threshold)] = -0.5  # Moderate downtrend
+        trend[(trend >= -threshold/2) & (trend <= threshold/2)] = 0  # Sideways
+        
+        return trend.fillna(0)
     
     def calculate_regime_confidence(self, features: np.ndarray, regime_labels: np.ndarray) -> np.ndarray:
         """Calculate confidence in regime classification using distance to cluster centers"""
@@ -466,11 +501,11 @@ class TradingStrategy:
         
         # Signal generation parameters - aggressive with risk management
         base_position_size = 2.0  # Increased base position size
-        max_position_size = 3.0  # Maximum allowed position size
+        max_position_size = self.max_position_size  # Maximum allowed position size
         min_confidence = 0.7  # Very high confidence requirement
-        momentum_threshold = 0.015  # Stronger momentum requirement
-        min_trend_strength = 0.02  # Stronger trend requirement
-        max_volatility = 1.0  # Strict volatility control
+        momentum_threshold = self.momentum_threshold  # Stronger momentum requirement
+        min_trend_strength = self.min_trend_strength  # Stronger trend requirement
+        max_volatility = self.max_volatility  # Strict volatility control
         
         # Combine signals
         signals = np.zeros(len(features))
@@ -491,17 +526,16 @@ class TradingStrategy:
                 continue
             
             # Enhanced position sizing with multiple factors
-            vol_factor = max(0.3, 1.5 - (volatility.iloc[i] / max_volatility))  # Increased minimum and range
-            trend_factor = min(2.0, (abs(trend.iloc[i]) / min_trend_strength) ** 1.5)  # Non-linear scaling
+            vol_factor = max(0.3, 1.2 - (volatility.iloc[i] / max_volatility))  # Increased minimum and range
+            trend_factor = (abs(trend.iloc[i]) / min_trend_strength) ** 0.8  # Less penalization for weaker trends
+            conf_factor = regime_confidence[i] if regime_confidence is not None else 1.0
             
-            # Regime confidence factor
-            regime_conf = regime_confidence[i] if i < len(regime_confidence) else 1.0
-            conf_factor = min(1.5, 0.5 + regime_conf)  # Scale 0.5 to 1.5 based on regime confidence
+            # Momentum impact on position size
+            momentum_impact = abs(momentum_pred[i]) / momentum_threshold
+            momentum_factor = max(0.5, min(1.5, momentum_impact))
             
-            # Momentum strength factor
-            momentum_factor = min(1.5, abs(momentum_pred[i] / momentum_threshold))
-            
-            # Calculate position size with all factors
+            # Base position size with momentum consideration
+            position_size = max_position_size * vol_factor * conf_factor * min(2.5, trend_factor) * momentum_factor
             position_scale = vol_factor * conf_factor * trend_factor * momentum_factor
             base_size = base_position_size * position_scale
             base_size = min(max_position_size, base_size)  # Cap at maximum
@@ -524,14 +558,29 @@ class TradingStrategy:
                 long_signals = np.roll(long_signals, -1)
                 short_signals = np.roll(short_signals, -1)
                 
-                # Simple trend following signals
+                # Enhanced trend-following signals with higher weight on trend
+                trend_value = trend.iloc[i]
+                momentum_value = momentum_pred[i]
+                
+                # Calculate trend confidence based on consistency
+                trend_consistency = np.sum(np.sign(trend.iloc[max(0, i-20):i+1]) == np.sign(trend_value)) / min(i+1, 20)
+                
+                # More balanced decision (60% trend, 40% momentum)
                 long_signal = False
-                if trend.iloc[i] > min_trend_strength and momentum_pred[i] > 0:
-                    long_signal = True
+                if trend_value > min_trend_strength:
+                    trend_score = 0.6 * (trend_value / min_trend_strength) * trend_consistency
+                    momentum_score = 0.4 * (momentum_value / momentum_threshold if momentum_value > 0 else 0)
+                    # Lower threshold for entry
+                    if (trend_score + momentum_score) > 0.6:
+                        long_signal = True
                 
                 short_signal = False
-                if trend.iloc[i] < -min_trend_strength and momentum_pred[i] < 0:
-                    short_signal = True
+                if trend_value < -min_trend_strength:
+                    trend_score = 0.6 * (abs(trend_value) / min_trend_strength) * trend_consistency
+                    momentum_score = 0.4 * (abs(momentum_value) / momentum_threshold if momentum_value < 0 else 0)
+                    # Lower threshold for entry
+                    if (trend_score + momentum_score) > 0.6:
+                        short_signal = True
                 
                 long_signals[-1] = 1 if long_signal else 0
                 short_signals[-1] = 1 if short_signal else 0

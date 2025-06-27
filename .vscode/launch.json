@@ -46,6 +46,12 @@
             "program": "run_me_hw7.py",
             "console": "integratedTerminal",
             "args": ["live"]
+        },
+        {   "name": "Debug: Final Work",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "run_me_final_work.py",
+            "console": "integratedTerminal"
         }
     ]
 }
