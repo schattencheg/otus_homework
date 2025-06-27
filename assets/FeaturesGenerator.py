@@ -139,7 +139,7 @@ class FeaturesGenerator:
                 df['MACD_x_RSI'] = df['MACD'] * df['RSI']
 
             # Drop NaN values introduced by rolling windows, shifts, and calculations
-            df = df.dropna()
+            df = df.dropna(axis=1, how='all').dropna()
 
             # Define feature columns
             feature_columns = [
@@ -210,6 +210,9 @@ class FeaturesGenerator:
             feature_columns.extend(additional_trading_features)
             
             # Prepare feature matrix
+            for column_name in feature_columns:
+                if column_name not in df.columns:
+                    feature_columns.remove(column_name)
             X = df[feature_columns].copy()
             
             # Handle missing and infinite values
