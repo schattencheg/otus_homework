@@ -18,13 +18,9 @@ from assets.FeaturesGenerator import FeaturesGenerator
 from assets.enums import DataPeriod, DataResolution
 from assets.Position import Position
 from assets.Order import Order
+import credentials
 
 pd.options.mode.chained_assignment = None  # default='warn'
-
-#os.environ['BINANCE_API_KEY'] = 'QvAaxE0hMuqjKSzGxE625DudfJ3F0N6cdYqqePUiAu1lm5wAwyKTOE3b285AM0VQ'
-os.environ['BINANCE_API_KEY'] = '58403be0fa92d27e90d5a259d0ae4d054ba73d2110ecc8d7586648bdb8961dd6'
-#os.environ['BINANCE_API_SECRET'] = 'i6mFGnlCk06tCbaQbVIrvFSNUc2xlhD9q5aULYZBFWSQbGLTJywsjzQNKOPOXXAb'
-os.environ['BINANCE_API_SECRET'] = '7082231dc0ce924912648aa83048f3650b32d5f50df52e722078a447d96fa05a'
 
 # Create necessary directories
 os.makedirs('models', exist_ok=True)
@@ -83,14 +79,26 @@ class TradingStrategy:
         with torch.no_grad():
             predictions = self.model(features).numpy()
         
-        # Add momentum to signals
+        # Print prediction statistics
+        print(f"\nPrediction stats:")
+        print(f"Mean: {predictions.mean():.3f}")
+        print(f"Min: {predictions.min():.3f}")
+        print(f"Max: {predictions.max():.3f}")
+        
+        # Add momentum to signals with more sensitive thresholds
         signals = []
         for pred in predictions:
             signal = 1 if pred > self.threshold else 0
-            # Only change position if we have a strong signal or opposite direction
-            if signal != self.last_signal and (pred > 0.55 or pred < 0.45):
+            # More sensitive thresholds: 0.52 for buy, 0.48 for sell
+            if signal != self.last_signal and (pred > 0.52 or pred < 0.48):
                 self.last_signal = signal
             signals.append(self.last_signal)
+        
+        # Print signal statistics
+        unique, counts = np.unique(signals, return_counts=True)
+        print(f"\nSignal distribution:")
+        for val, count in zip(unique, counts):
+            print(f"Signal {val}: {count} occurrences ({count/len(signals)*100:.1f}%)")
         
         return np.array(signals)
     
@@ -179,7 +187,6 @@ def flat_position(exchange: ccxt.Exchange):
     if current_position.contracts == 0:
         logging.info("Current position is FLAT")
 
-
 def get_position(exchange: ccxt.Exchange) -> float:
     """Get current position size. Positive for long, negative for short, 0 for no position."""
     try:
@@ -239,7 +246,7 @@ def save_model(model: nn.Module, metadata: Dict[str, Any], filepath: str):
     }
     torch.save(state, filepath)
 
-def run_backtest(data_provider: DataProvider, features_generator: FeaturesGenerator):
+def run_train(data_provider: DataProvider, features_generator: FeaturesGenerator):
     """Run backtest mode: train model and evaluate performance"""
     print("Running backtest mode...")
     
@@ -392,10 +399,18 @@ def train_and_evaluate(data: pd.DataFrame, features_generator: FeaturesGenerator
     # Generate features
     features_df, feature_names = features_generator.prepare_features(data)
     
-    # Create labels based on future returns
+    # Create labels based on future returns with stronger signals
     future_returns = data['Close'].pct_change(periods=3).shift(-3).iloc[:-3].values
-    labels = (future_returns > 0).astype(float)
-    labels = np.where(np.abs(future_returns) > 0.01, labels, 0.5)
+    
+    # Create binary labels: 1 for significant up moves, 0 for significant down moves
+    # Ignore very small moves by setting threshold
+    threshold = 0.005  # 0.5% threshold for significant moves
+    labels = np.zeros_like(future_returns)
+    labels[future_returns > threshold] = 1  # Strong up moves
+    labels[future_returns < -threshold] = 0  # Strong down moves
+    labels[np.abs(future_returns) <= threshold] = 0  # Small moves treated as sell signals
+    
+    # Align labels with features
     labels = labels[len(labels)-len(features_df):]
     
     # Prepare data for CNN
@@ -513,6 +528,82 @@ def save_results(model: nn.Module, results: dict, data: pd.DataFrame):
     # Save performance plot
     plot_strategy_performance(data, results)
 
+def run_backtest(model_path: str, data_provider: DataProvider, features_generator: FeaturesGenerator):
+    """Run backtest mode using saved model on historical data"""
+    print("Loading saved model...")
+    try:
+        state = torch.load(model_path, weights_only=False)
+        print("Model state keys:", state.keys())
+        metadata = state['metadata']
+        print("Metadata:", metadata)
+        
+        model = CNNModel(
+            input_channels=metadata['input_channels'],
+            sequence_length=metadata['sequence_length']
+        )
+        print(f"Model architecture:\n{model}")
+        
+        # Check if model state dict exists
+        if 'model_state_dict' not in state:
+            print("Error: model_state_dict not found in saved state")
+            if 'model_state' in state:
+                print("Found 'model_state' instead, using that")
+                model.load_state_dict(state['model_state'])
+            else:
+                raise KeyError("No model state found in saved file")
+        else:
+            model.load_state_dict(state['model_state_dict'])
+        
+        # Verify model parameters are loaded
+        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\nModel has {param_count} trainable parameters")
+        
+        model.eval()
+    except FileNotFoundError:
+        print(f"Error: Model file not found at {model_path}")
+        print("Please train a model first using 'python run_me_hw7.py train'")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        print("Please ensure the model was trained and saved correctly")
+        sys.exit(1)
+    
+    print("Loading historical data...")
+    data_provider.data_load()
+    data = data_provider.data[data_provider.tickers[0]]
+    
+    # Generate features
+    features_df, _ = features_generator.prepare_features(data)
+    features_array = features_df.values
+    
+    # Create sequences for CNN input
+    sequence_length = metadata['sequence_length']
+    sequences = []
+    for i in range(len(features_array) - sequence_length + 1):
+        sequence = features_array[i:i + sequence_length]
+        sequences.append(sequence)
+    
+    # Convert to tensor with shape (batch_size, n_features, sequence_length)
+    X = torch.FloatTensor(sequences)
+    X = X.transpose(1, 2)  # Shape: (n_samples, n_channels, sequence_length)
+    
+    # Run backtest
+    strategy = TradingStrategy(
+        model,
+        sequence_length=metadata['sequence_length'],
+        threshold=metadata['threshold']
+    )
+    
+    print("Running backtest...")
+    results = strategy.backtest(data, X)
+    
+    # Plot and save results
+    plot_strategy_performance(data, results)
+    print(f"\nBacktest Results:")
+    print(f"Final Balance: ${results['final_balance']:.2f}")
+    print(f"Return: {(results['final_balance'] / 100000 - 1) * 100:.2f}%")
+    print(f"Number of Trades: {len(results['trades'])}")
+
 def main():
     # Initialize components
     data_provider = DataProvider(
@@ -526,15 +617,18 @@ def main():
     # Parse command line arguments
     import argparse
     parser = argparse.ArgumentParser(description='CNN Trading Strategy')
-    parser.add_argument('mode', choices=['backtest', 'live'],
-                        help='Run mode: backtest (train model) or live (trade)')
+    parser.add_argument('mode', choices=['train', 'live', 'backtest'],
+                        help='Run mode: train, backtest or live (trade)')
     args = parser.parse_args()
     
-    if args.mode == 'backtest':
-        run_backtest(data_provider, features_generator)
-    else:
-        model_path = os.path.join('models', 'cnn_trader.pth')
+    model_path = os.path.join('models', 'cnn_trader.pth')
+    
+    if args.mode == 'train':
+        run_train(data_provider, features_generator)
+    elif args.mode == 'live':
         run_live_trading(model_path, data_provider, features_generator)
+    elif args.mode == 'backtest':
+        run_backtest(model_path, data_provider, features_generator)
     
 
 

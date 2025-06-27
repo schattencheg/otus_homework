@@ -499,9 +499,9 @@ class TradingStrategy:
         volatility = self.calculate_volatility(data['Returns'], window=20)
         volatility = volatility.bfill()
         
-        # Signal generation parameters - aggressive with risk management
-        base_position_size = 2.0  # Increased base position size
-        max_position_size = self.max_position_size  # Maximum allowed position size
+        # Signal generation parameters - based on portfolio percentage
+        base_portfolio_pct = 0.2  # Base position size as 20% of portfolio
+        max_portfolio_pct = 0.5  # Maximum position size as 50% of portfolio
         min_confidence = 0.7  # Very high confidence requirement
         momentum_threshold = self.momentum_threshold  # Stronger momentum requirement
         min_trend_strength = self.min_trend_strength  # Stronger trend requirement
@@ -534,19 +534,18 @@ class TradingStrategy:
             momentum_impact = abs(momentum_pred[i]) / momentum_threshold
             momentum_factor = max(0.5, min(1.5, momentum_impact))
             
-            # Base position size with momentum consideration
-            position_size = max_position_size * vol_factor * conf_factor * min(2.5, trend_factor) * momentum_factor
+            # Calculate position size as percentage of portfolio
             position_scale = vol_factor * conf_factor * trend_factor * momentum_factor
-            base_size = base_position_size * position_scale
-            base_size = min(max_position_size, base_size)  # Cap at maximum
+            portfolio_pct = base_portfolio_pct * position_scale
+            portfolio_pct = min(max_portfolio_pct, portfolio_pct)  # Cap at maximum percentage
             
             # Scale by momentum strength
             momentum_value = momentum_pred[i]
             momentum_strength = abs(momentum_value)
             
             if momentum_strength >= momentum_threshold:
-                position_sizes[i] = base_size * (momentum_strength / momentum_threshold)
-                position_sizes[i] = min(position_sizes[i], max_position_size)
+                position_sizes[i] = portfolio_pct * (momentum_strength / momentum_threshold)
+                position_sizes[i] = min(max_portfolio_pct, position_sizes[i])
             
             # Generate trade signals with trend following
             if i >= self.sequence_length:

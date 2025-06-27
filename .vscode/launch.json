@@ -45,7 +45,7 @@
             "request": "launch",
             "program": "run_me_hw7.py",
             "console": "integratedTerminal",
-            "args": ["live"]
+            "args": ["backtest"]
         },
         {   "name": "Debug: Final Work",
             "type": "debugpy",
