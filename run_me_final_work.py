@@ -148,11 +148,9 @@ class MarketRegimeClassifier:
 class TradingStrategy:
     """Main trading strategy combining multiple models"""
     
-    def __init__(self, sequence_length=20, momentum_threshold=0.01,
-                 min_trend_strength=0.015, max_volatility=1.2,
-                 trailing_stop_pct=0.025, max_loss_pct=0.035,
-                 profit_take_pct=0.045, min_holding_bars=3,
-                 max_position_size=2.0):
+    def __init__(self, sequence_length: int = 10, trailing_stop_pct: float = 0.02,
+                 max_loss_pct: float = 0.03, profit_take_pct: float = 0.04,
+                 min_holding_bars: int = 20):
         """Initialize strategy with sequence length and risk parameters
         
         Args:
@@ -160,23 +158,19 @@ class TradingStrategy:
             trailing_stop_pct: Initial trailing stop distance (6%)
             max_loss_pct: Maximum loss per trade (10%)
             profit_take_pct: Profit taking level (15%)
-            min_holding_bars: Minimum bars to hold position
+            min_holding_bars: Minimum bars to hold position (20 bars)
         """
         self.momentum_predictor = MomentumPredictor()
         self.cnn_predictor = None  # Will be initialized during training
         self.regime_classifier = MarketRegimeClassifier()
         
         self.sequence_length = sequence_length
-        self.momentum_threshold = momentum_threshold
-        self.min_trend_strength = min_trend_strength
-        self.max_volatility = max_volatility
         self.trailing_stop_pct = trailing_stop_pct
         self.max_loss_pct = max_loss_pct
         self.profit_take_pct = profit_take_pct
         self.min_holding_bars = min_holding_bars
-        self.max_position_size = max_position_size
         
-        self.position_size = 1.0  # Base position size
+        self.position_size = 0.02  # Position size as 2% of portfolio value
         
     def prepare_data(self, data: pd.DataFrame, features_generator: FeaturesGenerator) \
             -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
@@ -374,84 +368,18 @@ class TradingStrategy:
         """Calculate annualized volatility"""
         return returns.rolling(window=window).std() * np.sqrt(252)
     
-    def calculate_trend(self, prices: pd.Series):
-        """Enhanced trend detection using multiple technical indicators and timeframes"""
-        # Multiple timeframe EMAs
-        ema_spans = [10, 20, 50, 100, 200]  # Added more EMAs
-        emas = {span: prices.ewm(span=span, adjust=False).mean() for span in ema_spans}
+    def calculate_trend(self, prices: pd.Series) -> pd.Series:
+        """Calculate simple trend direction using EMA crossover and ROC"""
+        # Fast and slow EMAs
+        ema_fast = prices.ewm(span=10, adjust=False).mean()
+        ema_slow = prices.ewm(span=30, adjust=False).mean()
         
-        # Calculate slopes of EMAs
-        ema_slopes = {}
-        for span in ema_spans:
-            ema = emas[span]
-            ema_slopes[span] = (ema - ema.shift(5)) / ema.shift(5)  # 5-period slope
+        # Rate of change
+        roc = prices.pct_change(10)
         
-        # Rate of change across multiple timeframes with adaptive weights
-        roc_periods = [10, 20, 50, 100]  # Added longer timeframes
-        roc_series = {period: prices.pct_change(period) for period in roc_periods}
-        
-        # Volatility-adjusted ROC (higher weight in lower volatility)
-        volatility = prices.pct_change().rolling(20).std()
-        vol_adj_roc = {period: roc_series[period] / (volatility + 0.0001) for period in roc_periods}
-        
-        # Directional Movement Index (DMI)
-        high = prices.rolling(2).max()
-        low = prices.rolling(2).min()
-        pos_dm = high.diff().clip(lower=0)
-        neg_dm = (-low.diff()).clip(lower=0)
-        tr = pd.concat([high - low, abs(high - prices.shift()), abs(low - prices.shift())], axis=1).max(axis=1)
-        smoothing = 14
-        pos_di = 100 * pos_dm.rolling(smoothing).mean() / tr.rolling(smoothing).mean()
-        neg_di = 100 * neg_dm.rolling(smoothing).mean() / tr.rolling(smoothing).mean()
-        
-        # ADX for trend strength
-        dx = 100 * abs(pos_di - neg_di) / (pos_di + neg_di)
-        adx = dx.rolling(smoothing).mean()
-        
-        # Combine signals with dynamic weighting
-        trend = pd.Series(0.0, index=prices.index)
-        
-        # EMA alignment signals (40% total weight)
-        for i in range(len(ema_spans)-1):
-            # Check if EMAs are properly aligned for trend
-            if ema_spans[i] < ema_spans[i+1]:
-                trend[emas[ema_spans[i]] > emas[ema_spans[i+1]]] += 0.4 / (len(ema_spans)-1)
-                trend[emas[ema_spans[i]] < emas[ema_spans[i+1]]] -= 0.4 / (len(ema_spans)-1)
-        
-        # EMA slopes (20% weight)
-        for span, slope in ema_slopes.items():
-            weight = 0.2 / len(ema_slopes)
-            trend[slope > 0] += weight
-            trend[slope < 0] -= weight
-        
-        # Volatility-adjusted ROC (20% weight)
-        for period, roc in vol_adj_roc.items():
-            weight = 0.2 / len(vol_adj_roc)
-            trend[roc > 0] += weight
-            trend[roc < 0] -= weight
-        
-        # DMI and ADX (20% weight)
-        trend[pos_di > neg_di] += 0.1
-        trend[pos_di < neg_di] -= 0.1
-        
-        # Increase trend conviction when ADX is high
-        adx_factor = (adx / 100).clip(0, 1)  # Normalize to 0-1
-        trend = trend * (1 + adx_factor)  # Amplify trend when ADX is high
-        
-        # Normalize trend scores
-        trend = trend / trend.abs().rolling(100).mean()  # Adaptive normalization
-        
-        # Apply non-linear transformation to emphasize strong trends
-        trend = np.sign(trend) * np.abs(trend) ** 1.2
-        
-        # More sensitive trend classification
-        threshold = adx_factor.rolling(10).mean() * 0.4 + 0.25  # Lower and more responsive threshold
-        trend[trend > threshold] = 1  # Strong uptrend
-        trend[trend < -threshold] = -1  # Strong downtrend
-        # Partial trend signals for moderate trends
-        trend[(trend > threshold/2) & (trend <= threshold)] = 0.5  # Moderate uptrend
-        trend[(trend < -threshold/2) & (trend >= -threshold)] = -0.5  # Moderate downtrend
-        trend[(trend >= -threshold/2) & (trend <= threshold/2)] = 0  # Sideways
+        # Combine signals
+        trend = pd.Series(index=prices.index)
+        trend = ((ema_fast - ema_slow) / ema_slow) + (roc * 2)  # Give more weight to momentum
         
         return trend.fillna(0)
     
@@ -499,20 +427,19 @@ class TradingStrategy:
         volatility = self.calculate_volatility(data['Returns'], window=20)
         volatility = volatility.bfill()
         
-        # Signal generation parameters - based on portfolio percentage
-        base_portfolio_pct = 0.2  # Base position size as 20% of portfolio
-        max_portfolio_pct = 0.5  # Maximum position size as 50% of portfolio
-        min_confidence = 0.7  # Very high confidence requirement
-        momentum_threshold = self.momentum_threshold  # Stronger momentum requirement
-        min_trend_strength = self.min_trend_strength  # Stronger trend requirement
-        max_volatility = self.max_volatility  # Strict volatility control
+        # Signal generation parameters
+        max_position_size = self.position_size  # Maximum position size as percentage of portfolio
+        min_confidence = 0.2  # Minimal confidence requirement
+        momentum_threshold = 0.001  # Almost no momentum requirement
+        min_trend_strength = 0.001  # Almost no trend requirement
+        max_volatility = 2.0  # Very high volatility tolerance
         
         # Combine signals
         signals = np.zeros(len(features))
         position_sizes = np.zeros(len(features))
         
-        # Signal smoothing window - increased for reliable trend detection
-        signal_window = 20
+        # Signal smoothing window - reduced for faster signals
+        signal_window = 5
         long_signals = np.zeros(signal_window)
         short_signals = np.zeros(signal_window)
         
@@ -525,27 +452,21 @@ class TradingStrategy:
             if volatility.iloc[i] > max_volatility:
                 continue
             
-            # Enhanced position sizing with multiple factors
-            vol_factor = max(0.3, 1.2 - (volatility.iloc[i] / max_volatility))  # Increased minimum and range
-            trend_factor = (abs(trend.iloc[i]) / min_trend_strength) ** 0.8  # Less penalization for weaker trends
-            conf_factor = regime_confidence[i] if regime_confidence is not None else 1.0
+            # Position sizing with trend and volatility consideration
+            vol_factor = max(0.2, 1 - (volatility.iloc[i] / max_volatility))
+            trend_factor = abs(trend.iloc[i]) / min_trend_strength
+            conf_factor = 1.0
             
-            # Momentum impact on position size
-            momentum_impact = abs(momentum_pred[i]) / momentum_threshold
-            momentum_factor = max(0.5, min(1.5, momentum_impact))
-            
-            # Calculate position size as percentage of portfolio
-            position_scale = vol_factor * conf_factor * trend_factor * momentum_factor
-            portfolio_pct = base_portfolio_pct * position_scale
-            portfolio_pct = min(max_portfolio_pct, portfolio_pct)  # Cap at maximum percentage
+            # Base position size scaled by all factors
+            base_size = max_position_size * vol_factor * conf_factor * min(2.0, trend_factor)
             
             # Scale by momentum strength
             momentum_value = momentum_pred[i]
             momentum_strength = abs(momentum_value)
             
             if momentum_strength >= momentum_threshold:
-                position_sizes[i] = portfolio_pct * (momentum_strength / momentum_threshold)
-                position_sizes[i] = min(max_portfolio_pct, position_sizes[i])
+                position_sizes[i] = base_size * (momentum_strength / momentum_threshold)
+                position_sizes[i] = min(position_sizes[i], max_position_size)
             
             # Generate trade signals with trend following
             if i >= self.sequence_length:
@@ -557,29 +478,14 @@ class TradingStrategy:
                 long_signals = np.roll(long_signals, -1)
                 short_signals = np.roll(short_signals, -1)
                 
-                # Enhanced trend-following signals with higher weight on trend
-                trend_value = trend.iloc[i]
-                momentum_value = momentum_pred[i]
-                
-                # Calculate trend confidence based on consistency
-                trend_consistency = np.sum(np.sign(trend.iloc[max(0, i-20):i+1]) == np.sign(trend_value)) / min(i+1, 20)
-                
-                # More balanced decision (60% trend, 40% momentum)
+                # Simple trend following signals
                 long_signal = False
-                if trend_value > min_trend_strength:
-                    trend_score = 0.6 * (trend_value / min_trend_strength) * trend_consistency
-                    momentum_score = 0.4 * (momentum_value / momentum_threshold if momentum_value > 0 else 0)
-                    # Lower threshold for entry
-                    if (trend_score + momentum_score) > 0.6:
-                        long_signal = True
+                if trend.iloc[i] > min_trend_strength and momentum_pred[i] > 0:
+                    long_signal = True
                 
                 short_signal = False
-                if trend_value < -min_trend_strength:
-                    trend_score = 0.6 * (abs(trend_value) / min_trend_strength) * trend_consistency
-                    momentum_score = 0.4 * (abs(momentum_value) / momentum_threshold if momentum_value < 0 else 0)
-                    # Lower threshold for entry
-                    if (trend_score + momentum_score) > 0.6:
-                        short_signal = True
+                if trend.iloc[i] < -min_trend_strength and momentum_pred[i] < 0:
+                    short_signal = True
                 
                 long_signals[-1] = 1 if long_signal else 0
                 short_signals[-1] = 1 if short_signal else 0
@@ -659,8 +565,14 @@ class TradingStrategy:
             signal = signals[i]
             current_vol = volatility.iloc[i]
             
-            # Scale position size inversely with volatility
+            # Calculate current portfolio value including unrealized P&L
+            current_portfolio_value = balance
+            if position != 0:
+                current_portfolio_value += position * (close - entry_price)
+            
+            # Scale position size by volatility
             vol_scalar = min(1.0, 0.15 / current_vol) if current_vol > 0 else 1.0
+            position_size = position_sizes[i] * vol_scalar  # This is a percentage of portfolio value
             
             # Update position P&L and holding period
             if position != 0:
@@ -678,11 +590,11 @@ class TradingStrategy:
                     max_loss_stop = entry_price * (1 - max_loss_pct)
                     profit_take = entry_price * (1 + profit_take_pct)
                     
-                    # More conservative profit protection
-                    if close > profit_take * 2.0:  # 20% profit
-                        trailing_stop = max(trailing_stop, entry_price * 1.10)  # Lock in 10% profit
-                    elif close > profit_take * 1.5:  # 15% profit
+                    # Tighten stop if in significant profit
+                    if close > profit_take * 1.5:  # 15% profit
                         trailing_stop = max(trailing_stop, entry_price * 1.05)  # Lock in 5% profit
+                    elif close > profit_take:
+                        trailing_stop = max(trailing_stop, entry_price * 1.02)  # Lock in 2% profit
                     
                     stop_price = max(trailing_stop, max_loss_stop)
                     
@@ -754,10 +666,13 @@ class TradingStrategy:
             
             # Only open new positions if we don't have one and we're above 80% of max equity
             if signal != 0 and position == 0 and current_value >= 0.8 * max_equity:
-                position = signal
+                # Calculate position size as percentage of current portfolio value
+                position_size = position_sizes[i] * vol_scalar  # This is a percentage
+                position_value = current_portfolio_value * position_size  # Value in quote currency
+                position_amount = position_value / close  # Convert to base currency units
+                
+                position = signal * position_amount  # Set position size in base currency
                 entry_price = close
-                # Scale position size by volatility
-                position_size = position_sizes[i] * vol_scalar
                 holding_period = 0  # Reset holding period for new position
                 highest_price = close if signal > 0 else 0
                 lowest_price = close if signal < 0 else float('inf')
@@ -765,7 +680,8 @@ class TradingStrategy:
                     'type': 'open',
                     'direction': 'long' if signal > 0 else 'short',
                     'price': close,
-                    'size': position_size,
+                    'size': position_amount,  # Size in base currency
+                    'value': position_value,  # Value in quote currency
                     'balance': balance,
                     'time': data.index[i]
                 })
@@ -897,7 +813,6 @@ def plot_results(results: Dict[str, Any]) -> None:
     equity_dates = equity_data.index
     values = equity_data.values.flatten()
     
-    # ML Strategy equity curve
     fig.add_trace(
         go.Scatter(
             x=equity_dates,
@@ -908,18 +823,13 @@ def plot_results(results: Dict[str, Any]) -> None:
         row=2, col=1
     )
     
-    # Calculate Buy & Hold equity curve
-    initial_balance = values[0]
-    price_data = strategy_results['price_data']['Close']
-    bh_equity = price_data / price_data.iloc[0] * initial_balance
-    
-    # Plot Buy & Hold equity curve
+    # Buy & Hold line
     fig.add_trace(
         go.Scatter(
-            x=price_data.index,
-            y=bh_equity,
+            x=[equity_dates[0], equity_dates[-1]],
+            y=[bh_results['final_balance']] * 2,
             name='Buy & Hold',
-            line=dict(color='gray')
+            line=dict(color='gray', dash='dash')
         ),
         row=2, col=1
     )
@@ -936,7 +846,7 @@ def plot_results(results: Dict[str, Any]) -> None:
     short_exits_equity = []
     
     # Create lookup for price data
-    price_lookup = price_data.to_dict()
+    price_lookup = price_data['Close'].to_dict()
     
     # Track last trade direction to match exits with entries
     last_trade_direction = None
@@ -1042,53 +952,27 @@ def plot_results(results: Dict[str, Any]) -> None:
         ), row=2, col=1)
     
     # Plot performance metrics comparison
-    metrics = ['total_return', 'annual_return', 'sharpe_ratio', 'max_drawdown', 'win_rate']
-    labels = ['Total Return', 'Annual Return', 'Sharpe Ratio', 'Max Drawdown', 'Win Rate']
+    metrics = ['total_return', 'annual_return', 'sharpe_ratio', 'max_drawdown']
+    labels = ['Total Return', 'Annual Return', 'Sharpe Ratio', 'Max Drawdown']
     
-    # Add trades count as text annotation
-    trades_text = f'Number of Trades: {strategy_results["n_trades"]}'
-    
-    # ML Strategy metrics
-    ml_values = [strategy_results[m] if m != 'win_rate' else strategy_results.get('win_rate', 0) for m in metrics]
     fig.add_trace(
         go.Bar(
             x=labels,
-            y=ml_values,
+            y=[strategy_results[m] for m in metrics],
             name='ML Strategy',
-            marker_color='blue',
-            text=[f'{v:.1%}' if m != 'sharpe_ratio' else f'{v:.2f}' for v, m in zip(ml_values, metrics)],
-            textposition='outside'
+            marker_color='blue'
         ),
-        row=3, col=1
+        row=2, col=1
     )
     
-    # Buy & Hold metrics (excluding win rate which isn't applicable)
-    bh_values = [bh_results[m] if m in bh_results else None for m in metrics]
     fig.add_trace(
         go.Bar(
             x=labels,
-            y=bh_values,
+            y=[bh_results[m] for m in metrics],
             name='Buy & Hold',
-            marker_color='gray',
-            text=[f'{v:.1%}' if v is not None and m != 'sharpe_ratio' else (f'{v:.2f}' if v is not None else '') 
-                  for v, m in zip(bh_values, metrics)],
-            textposition='outside'
+            marker_color='gray'
         ),
         row=3, col=1
-    )
-    
-    # Add trades count annotation
-    fig.add_annotation(
-        x=0.02,
-        y=0.98,
-        xref='paper',
-        yref='paper',
-        text=trades_text,
-        showarrow=False,
-        font=dict(size=10),
-        align='left',
-        row=3,
-        col=1
     )
     
     # Update layout
