@@ -148,12 +148,28 @@ class MarketRegimeClassifier:
 class TradingStrategy:
     """Main trading strategy combining multiple models"""
     
-    def __init__(self):
+    def __init__(self, sequence_length: int = 10, trailing_stop_pct: float = 0.04,
+                 max_loss_pct: float = 0.08, profit_take_pct: float = 0.12,
+                 min_holding_bars: int = 5):
+        """Initialize strategy with sequence length and risk parameters
+        
+        Args:
+            sequence_length: Length of sequence for CNN
+            trailing_stop_pct: Initial trailing stop distance (6%)
+            max_loss_pct: Maximum loss per trade (10%)
+            profit_take_pct: Profit taking level (15%)
+            min_holding_bars: Minimum bars to hold position
+        """
         self.momentum_predictor = MomentumPredictor()
         self.cnn_predictor = None  # Will be initialized during training
         self.regime_classifier = MarketRegimeClassifier()
         
-        self.sequence_length = 20
+        self.sequence_length = sequence_length
+        self.trailing_stop_pct = trailing_stop_pct
+        self.max_loss_pct = max_loss_pct
+        self.profit_take_pct = profit_take_pct
+        self.min_holding_bars = min_holding_bars
+        
         self.position_size = 1.0  # Base position size
         
     def prepare_data(self, data: pd.DataFrame, features_generator: FeaturesGenerator) \
@@ -349,29 +365,59 @@ class TradingStrategy:
             raise
     
     def calculate_volatility(self, returns: pd.Series, window: int = 20) -> pd.Series:
-        """Calculate rolling volatility"""
+        """Calculate annualized volatility"""
         return returns.rolling(window=window).std() * np.sqrt(252)
+    
+    def calculate_trend(self, prices: pd.Series, windows=[10, 20, 50, 100]) -> pd.Series:
+        """Calculate trend direction using multiple EMAs and timeframes"""
+        trends = pd.DataFrame(index=prices.index)
+        
+        # Calculate EMAs for different timeframes
+        for window in windows:
+            ema = prices.ewm(span=window, adjust=False).mean()
+            trends[f'ema_{window}'] = ema
+            
+            # Calculate momentum for each timeframe
+            trends[f'momentum_{window}'] = prices.pct_change(window)
+            
+            # Calculate slope for each timeframe
+            trends[f'slope_{window}'] = (ema - ema.shift(window//2)) / ema.shift(window//2)
+        
+        # Calculate trend strength components
+        trend_strength = pd.Series(0, index=prices.index)
+        
+        # 1. EMA alignment (all EMAs aligned in same direction)
+        for i in range(len(windows)-1):
+            shorter = trends[f'ema_{windows[i]}']
+            longer = trends[f'ema_{windows[i+1]}']
+            trend_strength += ((shorter > longer) * 2 - 1) / (i + 1)  # Weight by inverse of timeframe
+        
+        # 2. Momentum alignment across timeframes
+        momentum_align = sum(np.sign(trends[f'momentum_{w}']) for w in windows)
+        trend_strength += momentum_align / len(windows)
+        
+        # 3. Slope strength across timeframes
+        slope_strength = sum(trends[f'slope_{w}'] for w in windows)
+        trend_strength += np.sign(slope_strength) * np.abs(slope_strength) ** 0.5  # Square root to dampen large values
+        
+        # 4. Price position relative to EMAs
+        for window in windows:
+            trend_strength += np.sign(prices - trends[f'ema_{window}']) / len(windows)
+        
+        # Normalize and apply sigmoid-like transformation to bound values
+        trend_strength = trend_strength / (len(windows) * 2)  # Normalize to roughly [-1, 1]
+        trend_strength = trend_strength * (1 - np.exp(-np.abs(trend_strength))) # Dampen weak signals
+        
+        return trend_strength.fillna(0)
     
     def calculate_regime_confidence(self, features: np.ndarray, regime_labels: np.ndarray) -> np.ndarray:
         """Calculate confidence in regime classification using distance to cluster centers"""
         distances = self.regime_classifier.kmeans.transform(self.regime_classifier.scaler.transform(features))
         confidences = 1 - (distances[np.arange(len(regime_labels)), regime_labels] / np.max(distances, axis=1))
         return confidences
-        
-    def calculate_trend(self, prices: pd.Series, window: int = 50) -> pd.Series:
-        """Calculate trend using exponential moving averages with longer window"""
-        short_ema = prices.ewm(span=window, adjust=False).mean()
-        long_ema = prices.ewm(span=window*2, adjust=False).mean()
-        
-        # Calculate trend strength
-        trend_strength = (short_ema - long_ema) / long_ema
-        
-        # Return trend direction weighted by strength
-        return pd.Series(np.sign(trend_strength) * np.minimum(abs(trend_strength) * 100, 1), 
-                        index=prices.index)
     
     def generate_signals(self, data: pd.DataFrame, features_generator: FeaturesGenerator) -> Tuple[np.ndarray, np.ndarray, float]:
-        """Generate trading signals using the ensemble of models"""
+        """Generate trading signals using the ensemble of models with improved trend detection"""
         features, _ = features_generator.prepare_features(data)
         
         # Align data
@@ -403,122 +449,69 @@ class TradingStrategy:
         with torch.no_grad():
             trade_pred = torch.softmax(self.cnn_predictor(sequence_tensor), dim=1)
         
-        # Calculate volatility and trend
-        volatility = self.calculate_volatility(data['Returns'], window=20)
+        # Calculate volatility with longer window
+        volatility = self.calculate_volatility(data['Returns'], window=30)
         volatility = volatility.bfill()
-        trend = self.calculate_trend(data['Close'], window=50)
         
-        # Calculate longer-term trend strength
+        # Calculate multi-timeframe trend
+        trend_strength = self.calculate_trend(data['Close'], windows=[20, 50, 100, 200])
+        
+        # Calculate additional trend confirmation indicators
+        sma_20 = data['Close'].rolling(window=20).mean()
         sma_50 = data['Close'].rolling(window=50).mean()
         sma_200 = data['Close'].rolling(window=200).mean()
-        trend_strength = ((sma_50 - sma_200) / sma_200).fillna(0)
         
-        # Signal generation parameters
+        # Calculate price position relative to SMAs for trend confirmation
+        price_vs_sma = pd.Series(index=data.index, dtype=float)
+        price_vs_sma = (data['Close'] > sma_20).astype(int) + \
+                       (data['Close'] > sma_50).astype(int) + \
+                       (data['Close'] > sma_200).astype(int)
+        price_vs_sma = (price_vs_sma - 1.5) / 1.5  # Scale to [-1, 1]
+        
+        # Multiple trend strength indicators
+        trend_strength_short = ((sma_20 - sma_50) / sma_50).fillna(0)
+        trend_strength_long = ((sma_50 - sma_200) / sma_200).fillna(0)
+        trend_strength = (0.6 * trend_strength_short + 0.4 * trend_strength_long)
+        
+        # Signal generation parameters - less conservative
         max_position_size = 1.0
-        min_confidence = 0.25
-        max_volatility = 1.2
-        momentum_threshold = 0.003
+        min_confidence = 0.5  # Reduced confidence requirement
+        momentum_threshold = 0.2  # Lower momentum requirement
+        min_trend_strength = 0.2  # Lower trend strength requirement
+        max_volatility = 0.6  # Higher volatility tolerance
         
+        # Combine signals
         signals = np.zeros(len(features))
         position_sizes = np.zeros(len(features))
         
-        # Signal smoothing window
-        signal_window = 5
+        # Signal smoothing window - increased for more persistence
+        signal_window = 8
         long_signals = np.zeros(signal_window)
         short_signals = np.zeros(signal_window)
+        
+        # Track holding periods
+        holding_period = 0
+        last_signal = 0
         
         for i in range(len(features)):
             # Skip if volatility is too high or regime confidence is too low
             if volatility.iloc[i] > max_volatility or regime_confidence[i] < min_confidence:
                 continue
             
-            # Skip if in ranging regime and trend is weak
-            if regime[i] == 0 and abs(trend_strength.iloc[i]) < 0.01:
+            # Skip if trend is too weak
+            if abs(trend_strength.iloc[i]) < min_trend_strength:
                 continue
             
-            # Calculate position size factors
+            # Position sizing with trend and volatility consideration
             vol_factor = max(0.2, 1 - (volatility.iloc[i] / max_volatility))
+            trend_factor = abs(trend_strength.iloc[i]) / min_trend_strength
             conf_factor = regime_confidence[i] * (1 + abs(trend_strength.iloc[i]))
-            base_size = max_position_size * vol_factor * conf_factor
             
-            # Scale position size by momentum strength
+            # Base position size scaled by all factors
+            base_size = max_position_size * vol_factor * conf_factor * min(2.0, trend_factor)
+            
+            # Scale by momentum strength
             momentum_value = momentum_pred[i]
-            momentum_strength = abs(momentum_value)
-            
-            if momentum_strength >= momentum_threshold:
-                position_sizes[i] = base_size * (momentum_strength / momentum_threshold)
-                position_sizes[i] = min(position_sizes[i], max_position_size)
-            
-            # Generate signals only after we have enough sequence data
-            if i >= self.sequence_length:
-                pred_idx = i - self.sequence_length
-                long_prob = trade_pred[pred_idx, 1].item()
-                short_prob = trade_pred[pred_idx, 0].item()
-                
-                # Update signal windows
-                long_signals = np.roll(long_signals, -1)
-                short_signals = np.roll(short_signals, -1)
-                
-                # Check signal conditions
-                long_signal = (long_prob > 0.53 and 
-                             momentum_value > momentum_threshold and 
-                             trend.iloc[i] > 0)
-                short_signal = (short_prob > 0.53 and 
-                              momentum_value < -momentum_threshold and 
-                              trend.iloc[i] < 0)
-                
-                long_signals[-1] = 1 if long_signal else 0
-                short_signals[-1] = 1 if short_signal else 0
-                
-                # Generate final signals based on persistence
-                if np.sum(long_signals) >= signal_window * 0.6 and trend_strength.iloc[i] > 0:
-                    signals[i] = 1
-                elif np.sum(short_signals) >= signal_window * 0.6 and trend_strength.iloc[i] < 0:
-                    signals[i] = -1
-        
-        return signals, position_sizes, np.mean(momentum_pred)
-        
-        # Calculate volatility and trend with longer windows
-        volatility = self.calculate_volatility(data['Returns'], window=20)  # Increased window
-        volatility = volatility.bfill()
-        trend = self.calculate_trend(data['Close'], short_window=20, long_window=50)  # Longer trend window
-        
-        # Calculate additional trend indicators
-        sma_50 = data['Close'].rolling(window=50).mean()
-        sma_200 = data['Close'].rolling(window=200).mean()
-        trend_strength = ((sma_50 - sma_200) / sma_200).fillna(0)
-        
-        # Define risk parameters with reduced sensitivity
-        max_position_size = 1.0
-        min_confidence = 0.25  # Lower confidence requirement
-        max_volatility = 1.2  # Higher volatility tolerance
-        momentum_threshold = 0.003  # Lower momentum threshold
-        
-        # Combine signals
-        signals = np.zeros(len(features))
-        position_sizes = np.zeros(len(features))
-        
-        # Track signal persistence
-        signal_window = 5
-        long_signals = np.zeros(signal_window)
-        short_signals = np.zeros(signal_window)
-        
-        for i in range(len(features)):
-            # Basic volatility and regime checks
-            if volatility.iloc[i] > max_volatility or regime_confidence[i] < min_confidence:
-                continue
-            
-            # More sophisticated regime analysis
-            if regime[i] == 0 and trend_strength.iloc[i] < 0.01:  # Low liquidity and weak trend
-                continue
-            
-            # Position sizing with trend consideration
-            vol_factor = max(0.2, 1 - (volatility.iloc[i] / max_volatility))  # Minimum 20% size
-            conf_factor = regime_confidence[i] * (1 + abs(trend_strength.iloc[i]))
-            base_size = max_position_size * vol_factor * conf_factor
-            
-            # Momentum analysis with trend alignment
-            momentum_value = momentum_pred.iloc[i]
             momentum_strength = abs(momentum_value)
             
             if momentum_strength >= momentum_threshold:
@@ -535,22 +528,51 @@ class TradingStrategy:
                 long_signals = np.roll(long_signals, -1)
                 short_signals = np.roll(short_signals, -1)
                 
-                # Calculate signal strength with trend alignment
-                long_signal = (long_prob > 0.53 and 
+                # Check signal conditions with stricter requirements
+                long_signal = (long_prob > 0.55 and 
                              momentum_value > momentum_threshold and 
-                             trend.iloc[i] > 0)
-                short_signal = (short_prob > 0.53 and 
+                             trend.iloc[i] > min_trend_strength and
+                             trend_strength.iloc[i] > min_trend_strength and
+                             regime[i] != 0)  # Not in ranging regime
+                short_signal = (short_prob > 0.55 and 
                               momentum_value < -momentum_threshold and 
-                              trend.iloc[i] < 0)
+                              trend.iloc[i] < -min_trend_strength and
+                              trend_strength.iloc[i] < -min_trend_strength and
+                              regime[i] != 0)  # Not in ranging regime
                 
                 long_signals[-1] = 1 if long_signal else 0
                 short_signals[-1] = 1 if short_signal else 0
                 
-                # Generate signals only on persistent conditions
-                if np.sum(long_signals) >= signal_window * 0.6 and trend_strength.iloc[i] > 0:
-                    signals[i] = 1
-                elif np.sum(short_signals) >= signal_window * 0.6 and trend_strength.iloc[i] < 0:
-                    signals[i] = -1
+                # Generate signals with more lenient persistence
+                long_persistence = np.sum(long_signals) / signal_window
+                short_persistence = np.sum(short_signals) / signal_window
+                
+                # Less strict trend requirements
+                current_trend = trend_strength.iloc[max(0, i-signal_window):i+1].mean()
+                
+                if long_persistence >= 0.6:  # 60% signal persistence
+                    if current_trend > 0:  # Trend following long
+                        if trend_strength.iloc[i] > min_trend_strength:
+                            signals[i] = 1
+                    else:  # Counter-trend long
+                        if trend_strength.iloc[i] > min_trend_strength * 1.5:  # Reduced counter-trend requirement
+                            signals[i] = 1
+                            
+                elif short_persistence >= 0.6:  # 60% signal persistence
+                    if current_trend < 0:  # Trend following short
+                        if trend_strength.iloc[i] < -min_trend_strength:
+                            signals[i] = -1
+                    else:  # Counter-trend short
+                        if trend_strength.iloc[i] < -min_trend_strength * 1.5:  # Reduced counter-trend requirement
+                            signals[i] = -1
+                
+                # Update holding period
+                if signals[i] != 0:
+                    if signals[i] == last_signal:  # Same direction
+                        holding_period += 1
+                    else:  # New signal
+                        holding_period = 0
+                        last_signal = signals[i]
         
         return signals, position_sizes, np.mean(momentum_pred)
     
@@ -579,43 +601,142 @@ class TradingStrategy:
     
     def backtest(self, data: pd.DataFrame, features_generator: FeaturesGenerator) -> Dict[str, Any]:
         """Run backtest of the strategy"""
-        initial_balance = 10000
+        initial_balance = 100000
         balance = initial_balance
         position = 0
         entry_price = 0
         trades = []
         equity_values = []  # Will store equity values aligned with data
-    
+        holding_period = 0  # Track how long we've been in a position
+        
+        # Use risk parameters from initialization
+        trailing_stop_pct = self.trailing_stop_pct
+        max_loss_pct = self.max_loss_pct
+        profit_take_pct = self.profit_take_pct
+        min_holding_bars = self.min_holding_bars
+        highest_price = 0
+        lowest_price = float('inf')
+        
+        # Calculate volatility for position sizing
+        returns_series = data['Close'].pct_change()
+        volatility = returns_series.rolling(window=20).std()
+        volatility = volatility.bfill()
+        
         # Get signals and position sizes
         signals, position_sizes, avg_momentum = self.generate_signals(data, features_generator)
         
-        # Calculate returns and volatility for Sharpe ratio
+        # Calculate returns for Sharpe ratio
         returns = []
+        max_equity = initial_balance
         
         # Run backtest
         for i in range(len(signals)):
             close = data['Close'].iloc[i]
             signal = signals[i]
+            current_vol = volatility.iloc[i]
             
-            # Update position P&L
+            # Scale position size inversely with volatility
+            vol_scalar = min(1.0, 0.15 / current_vol) if current_vol > 0 else 1.0
+            
+            # Update position P&L and holding period
             if position != 0:
                 unrealized_pnl = position * (close - entry_price)
                 current_value = balance + unrealized_pnl
+                holding_period += 1  # Increment holding period
+                
+                # Update trailing stops, check max loss and profit taking
+                if position > 0:  # Long position
+                    highest_price = max(highest_price, close)
+                    
+                    # Dynamic trailing stop based on holding period
+                    dynamic_stop_pct = max(0.02, trailing_stop_pct - (holding_period * 0.001))  # Tighten stop over time
+                    trailing_stop = highest_price * (1 - dynamic_stop_pct)
+                    max_loss_stop = entry_price * (1 - max_loss_pct)
+                    profit_take = entry_price * (1 + profit_take_pct)
+                    
+                    # Tighten stop if in significant profit
+                    if close > profit_take * 1.5:  # 15% profit
+                        trailing_stop = max(trailing_stop, entry_price * 1.05)  # Lock in 5% profit
+                    elif close > profit_take:
+                        trailing_stop = max(trailing_stop, entry_price * 1.02)  # Lock in 2% profit
+                    
+                    stop_price = max(trailing_stop, max_loss_stop)
+                    
+                    # Only allow stops after minimum holding period
+                    if holding_period < min_holding_bars:
+                        stop_price = max_loss_stop  # Only use max loss stop during initial period
+                    
+                    if close < stop_price:
+                        # Close position due to stop
+                        pnl = position * (close - entry_price)
+                        balance += pnl
+                        trades.append({
+                            'type': 'close',
+                            'price': close,
+                            'pnl': pnl,
+                            'balance': balance,
+                            'time': data.index[i],
+                            'reason': 'stop_loss' if close <= max_loss_stop else 'trailing_stop'
+                        })
+                        position = 0
+                        entry_price = 0
+                        highest_price = 0
+                else:  # Short position
+                    lowest_price = min(lowest_price, close)
+                    
+                    # Dynamic trailing stop based on holding period
+                    dynamic_stop_pct = max(0.02, trailing_stop_pct - (holding_period * 0.001))  # Tighten stop over time
+                    trailing_stop = lowest_price * (1 + dynamic_stop_pct)
+                    max_loss_stop = entry_price * (1 + max_loss_pct)
+                    profit_take = entry_price * (1 - profit_take_pct)
+                    
+                    # Tighten stop if in significant profit
+                    if close < profit_take * 0.5:  # 15% profit
+                        trailing_stop = min(trailing_stop, entry_price * 0.95)  # Lock in 5% profit
+                    elif close < profit_take:
+                        trailing_stop = min(trailing_stop, entry_price * 0.98)  # Lock in 2% profit
+                    
+                    stop_price = min(trailing_stop, max_loss_stop)
+                    
+                    # Only allow stops after minimum holding period
+                    if holding_period < min_holding_bars:
+                        stop_price = max_loss_stop  # Only use max loss stop during initial period
+                    
+                    if close > stop_price:
+                        # Close position due to stop
+                        pnl = position * (close - entry_price)
+                        balance += pnl
+                        trades.append({
+                            'type': 'close',
+                            'price': close,
+                            'pnl': pnl,
+                            'balance': balance,
+                            'time': data.index[i],
+                            'reason': 'stop_loss' if close >= max_loss_stop else 'trailing_stop'
+                        })
+                        position = 0
+                        entry_price = 0
+                        lowest_price = float('inf')
             else:
                 current_value = balance
             
             equity_values.append(current_value)
+            max_equity = max(max_equity, current_value)
             
             # Calculate return for this period
             if len(equity_values) > 1:
                 period_return = (equity_values[-1] - equity_values[-2]) / equity_values[-2]
                 returns.append(period_return)
             
-            if signal != 0 and position == 0:
-                # Open position
+            # Only open new positions if we don't have one and we're above 80% of max equity
+            if signal != 0 and position == 0 and current_value >= 0.8 * max_equity:
                 position = signal
                 entry_price = close
-                position_size = position_sizes[i]
+                # Scale position size by volatility
+                position_size = position_sizes[i] * vol_scalar
+                holding_period = 0  # Reset holding period for new position
+                highest_price = close if signal > 0 else 0
+                lowest_price = close if signal < 0 else float('inf')
                 trades.append({
                     'type': 'open',
                     'direction': 'long' if signal > 0 else 'short',
@@ -624,7 +745,7 @@ class TradingStrategy:
                     'balance': balance,
                     'time': data.index[i]
                 })
-            elif position != 0 and (signal == 0 or signal == -position):
+            elif position != 0 and signal == -position:  # Signal reversal
                 # Close position
                 pnl = position * (close - entry_price)
                 balance += pnl
@@ -633,16 +754,39 @@ class TradingStrategy:
                     'price': close,
                     'pnl': pnl,
                     'balance': balance,
-                    'time': data.index[i]
+                    'time': data.index[i],
+                    'reason': 'signal_reversal'
                 })
                 position = 0
                 entry_price = 0
-        # Calculate strategy metrics
-        total_return = (balance - initial_balance) / initial_balance
-        annual_return = (1 + total_return) ** (252 / len(data)) - 1
+                highest_price = 0
+                holding_period = 0  # Reset holding period
+                lowest_price = float('inf')
+        
+        # Close any remaining position at the end
+        if position != 0:
+            close = data['Close'].iloc[-1]
+            pnl = position * (close - entry_price)
+            balance += pnl
+            trades.append({
+                'type': 'close',
+                'price': close,
+                'pnl': pnl,
+                'balance': balance,
+                'time': data.index[-1],
+                'reason': 'end_of_data'
+            })
         
         # Create equity curve series
         equity_curve = pd.Series(equity_values, index=data.index[:len(equity_values)])
+        
+        # Calculate strategy metrics
+        total_return = (balance - initial_balance) / initial_balance
+        # Handle negative returns properly for annual calculation
+        if total_return <= -1:
+            annual_return = -1  # -100%
+        else:
+            annual_return = (1 + total_return) ** (252 / len(data)) - 1
         
         # Calculate Sharpe ratio
         returns_array = np.array(returns)
@@ -913,9 +1057,12 @@ def plot_results(results: Dict[str, Any]) -> None:
     fig.write_html('data/strategy_results.html')
 
 def main():
+    
+    ticker = '6B'
+    ticker = 'BTC/USDT'
     # Initialize components
     data_provider = DataProvider(
-        tickers=['BTC/USDT'],
+        tickers=[ticker],
         resolution=DataResolution.DAY_01,
         period=DataPeriod.YEAR_01
     )
@@ -924,7 +1071,8 @@ def main():
     # Load and process data
     print("Loading and processing data...")
     data_provider.data_load()
-    df = data_provider.data_processed['BTC/USDT']
+    df = data_provider.data_processed[ticker]
+    df = data_provider.data[ticker]
     
     # Create and train strategy
     print("\nInitializing and training strategy...")
