@@ -148,9 +148,9 @@ class MarketRegimeClassifier:
 class TradingStrategy:
     """Main trading strategy combining multiple models"""
     
-    def __init__(self, sequence_length: int = 10, trailing_stop_pct: float = 0.04,
-                 max_loss_pct: float = 0.08, profit_take_pct: float = 0.12,
-                 min_holding_bars: int = 5):
+    def __init__(self, sequence_length: int = 10, trailing_stop_pct: float = 0.02,
+                 max_loss_pct: float = 0.03, profit_take_pct: float = 0.04,
+                 min_holding_bars: int = 2):
         """Initialize strategy with sequence length and risk parameters
         
         Args:
@@ -368,47 +368,20 @@ class TradingStrategy:
         """Calculate annualized volatility"""
         return returns.rolling(window=window).std() * np.sqrt(252)
     
-    def calculate_trend(self, prices: pd.Series, windows=[10, 20, 50, 100]) -> pd.Series:
-        """Calculate trend direction using multiple EMAs and timeframes"""
-        trends = pd.DataFrame(index=prices.index)
+    def calculate_trend(self, prices: pd.Series) -> pd.Series:
+        """Calculate simple trend direction using EMA crossover and ROC"""
+        # Fast and slow EMAs
+        ema_fast = prices.ewm(span=10, adjust=False).mean()
+        ema_slow = prices.ewm(span=30, adjust=False).mean()
         
-        # Calculate EMAs for different timeframes
-        for window in windows:
-            ema = prices.ewm(span=window, adjust=False).mean()
-            trends[f'ema_{window}'] = ema
-            
-            # Calculate momentum for each timeframe
-            trends[f'momentum_{window}'] = prices.pct_change(window)
-            
-            # Calculate slope for each timeframe
-            trends[f'slope_{window}'] = (ema - ema.shift(window//2)) / ema.shift(window//2)
+        # Rate of change
+        roc = prices.pct_change(10)
         
-        # Calculate trend strength components
-        trend_strength = pd.Series(0, index=prices.index)
+        # Combine signals
+        trend = pd.Series(index=prices.index)
+        trend = ((ema_fast - ema_slow) / ema_slow) + (roc * 2)  # Give more weight to momentum
         
-        # 1. EMA alignment (all EMAs aligned in same direction)
-        for i in range(len(windows)-1):
-            shorter = trends[f'ema_{windows[i]}']
-            longer = trends[f'ema_{windows[i+1]}']
-            trend_strength += ((shorter > longer) * 2 - 1) / (i + 1)  # Weight by inverse of timeframe
-        
-        # 2. Momentum alignment across timeframes
-        momentum_align = sum(np.sign(trends[f'momentum_{w}']) for w in windows)
-        trend_strength += momentum_align / len(windows)
-        
-        # 3. Slope strength across timeframes
-        slope_strength = sum(trends[f'slope_{w}'] for w in windows)
-        trend_strength += np.sign(slope_strength) * np.abs(slope_strength) ** 0.5  # Square root to dampen large values
-        
-        # 4. Price position relative to EMAs
-        for window in windows:
-            trend_strength += np.sign(prices - trends[f'ema_{window}']) / len(windows)
-        
-        # Normalize and apply sigmoid-like transformation to bound values
-        trend_strength = trend_strength / (len(windows) * 2)  # Normalize to roughly [-1, 1]
-        trend_strength = trend_strength * (1 - np.exp(-np.abs(trend_strength))) # Dampen weak signals
-        
-        return trend_strength.fillna(0)
+        return trend.fillna(0)
     
     def calculate_regime_confidence(self, features: np.ndarray, regime_labels: np.ndarray) -> np.ndarray:
         """Calculate confidence in regime classification using distance to cluster centers"""
@@ -449,43 +422,24 @@ class TradingStrategy:
         with torch.no_grad():
             trade_pred = torch.softmax(self.cnn_predictor(sequence_tensor), dim=1)
         
-        # Calculate volatility with longer window
-        volatility = self.calculate_volatility(data['Returns'], window=30)
+        # Calculate simple trend and volatility
+        trend = self.calculate_trend(data['Close'])
+        volatility = self.calculate_volatility(data['Returns'], window=20)
         volatility = volatility.bfill()
         
-        # Calculate multi-timeframe trend
-        trend_strength = self.calculate_trend(data['Close'], windows=[20, 50, 100, 200])
-        
-        # Calculate additional trend confirmation indicators
-        sma_20 = data['Close'].rolling(window=20).mean()
-        sma_50 = data['Close'].rolling(window=50).mean()
-        sma_200 = data['Close'].rolling(window=200).mean()
-        
-        # Calculate price position relative to SMAs for trend confirmation
-        price_vs_sma = pd.Series(index=data.index, dtype=float)
-        price_vs_sma = (data['Close'] > sma_20).astype(int) + \
-                       (data['Close'] > sma_50).astype(int) + \
-                       (data['Close'] > sma_200).astype(int)
-        price_vs_sma = (price_vs_sma - 1.5) / 1.5  # Scale to [-1, 1]
-        
-        # Multiple trend strength indicators
-        trend_strength_short = ((sma_20 - sma_50) / sma_50).fillna(0)
-        trend_strength_long = ((sma_50 - sma_200) / sma_200).fillna(0)
-        trend_strength = (0.6 * trend_strength_short + 0.4 * trend_strength_long)
-        
-        # Signal generation parameters - less conservative
+        # Signal generation parameters - super aggressive
         max_position_size = 1.0
-        min_confidence = 0.5  # Reduced confidence requirement
-        momentum_threshold = 0.2  # Lower momentum requirement
-        min_trend_strength = 0.2  # Lower trend strength requirement
-        max_volatility = 0.6  # Higher volatility tolerance
+        min_confidence = 0.2  # Minimal confidence requirement
+        momentum_threshold = 0.001  # Almost no momentum requirement
+        min_trend_strength = 0.001  # Almost no trend requirement
+        max_volatility = 2.0  # Very high volatility tolerance
         
         # Combine signals
         signals = np.zeros(len(features))
         position_sizes = np.zeros(len(features))
         
-        # Signal smoothing window - increased for more persistence
-        signal_window = 8
+        # Signal smoothing window - reduced for faster signals
+        signal_window = 5
         long_signals = np.zeros(signal_window)
         short_signals = np.zeros(signal_window)
         
@@ -494,18 +448,14 @@ class TradingStrategy:
         last_signal = 0
         
         for i in range(len(features)):
-            # Skip if volatility is too high or regime confidence is too low
-            if volatility.iloc[i] > max_volatility or regime_confidence[i] < min_confidence:
-                continue
-            
-            # Skip if trend is too weak
-            if abs(trend_strength.iloc[i]) < min_trend_strength:
+            # Skip if volatility is too high
+            if volatility.iloc[i] > max_volatility:
                 continue
             
             # Position sizing with trend and volatility consideration
             vol_factor = max(0.2, 1 - (volatility.iloc[i] / max_volatility))
-            trend_factor = abs(trend_strength.iloc[i]) / min_trend_strength
-            conf_factor = regime_confidence[i] * (1 + abs(trend_strength.iloc[i]))
+            trend_factor = abs(trend.iloc[i]) / min_trend_strength
+            conf_factor = 1.0
             
             # Base position size scaled by all factors
             base_size = max_position_size * vol_factor * conf_factor * min(2.0, trend_factor)
@@ -528,43 +478,23 @@ class TradingStrategy:
                 long_signals = np.roll(long_signals, -1)
                 short_signals = np.roll(short_signals, -1)
                 
-                # Check signal conditions with stricter requirements
-                long_signal = (long_prob > 0.55 and 
-                             momentum_value > momentum_threshold and 
-                             trend.iloc[i] > min_trend_strength and
-                             trend_strength.iloc[i] > min_trend_strength and
-                             regime[i] != 0)  # Not in ranging regime
-                short_signal = (short_prob > 0.55 and 
-                              momentum_value < -momentum_threshold and 
-                              trend.iloc[i] < -min_trend_strength and
-                              trend_strength.iloc[i] < -min_trend_strength and
-                              regime[i] != 0)  # Not in ranging regime
+                # Simple trend following signals
+                long_signal = False
+                if trend.iloc[i] > min_trend_strength and momentum_pred[i] > 0:
+                    long_signal = True
+                
+                short_signal = False
+                if trend.iloc[i] < -min_trend_strength and momentum_pred[i] < 0:
+                    short_signal = True
                 
                 long_signals[-1] = 1 if long_signal else 0
                 short_signals[-1] = 1 if short_signal else 0
                 
-                # Generate signals with more lenient persistence
-                long_persistence = np.sum(long_signals) / signal_window
-                short_persistence = np.sum(short_signals) / signal_window
-                
-                # Less strict trend requirements
-                current_trend = trend_strength.iloc[max(0, i-signal_window):i+1].mean()
-                
-                if long_persistence >= 0.6:  # 60% signal persistence
-                    if current_trend > 0:  # Trend following long
-                        if trend_strength.iloc[i] > min_trend_strength:
-                            signals[i] = 1
-                    else:  # Counter-trend long
-                        if trend_strength.iloc[i] > min_trend_strength * 1.5:  # Reduced counter-trend requirement
-                            signals[i] = 1
-                            
-                elif short_persistence >= 0.6:  # 60% signal persistence
-                    if current_trend < 0:  # Trend following short
-                        if trend_strength.iloc[i] < -min_trend_strength:
-                            signals[i] = -1
-                    else:  # Counter-trend short
-                        if trend_strength.iloc[i] < -min_trend_strength * 1.5:  # Reduced counter-trend requirement
-                            signals[i] = -1
+                # Simple trend following with minimal filtering
+                if momentum_pred[i] > momentum_threshold and trend.iloc[i] > min_trend_strength:
+                    signals[i] = 1  # Long signal
+                elif momentum_pred[i] < -momentum_threshold and trend.iloc[i] < -min_trend_strength:
+                    signals[i] = -1  # Short signal
                 
                 # Update holding period
                 if signals[i] != 0:
@@ -1056,10 +986,7 @@ def plot_results(results: Dict[str, Any]) -> None:
     os.makedirs('data', exist_ok=True)
     fig.write_html('data/strategy_results.html')
 
-def main():
-    
-    ticker = '6B'
-    ticker = 'BTC/USDT'
+def main(ticker = 'BTC/USDT'):
     # Initialize components
     data_provider = DataProvider(
         tickers=[ticker],
@@ -1120,4 +1047,5 @@ def main():
     print("\nInteractive results plot saved to data/strategy_results.html")
 
 if __name__ == '__main__':
-    main()
+    #main('BTC/USDT')
+    main('6B')
